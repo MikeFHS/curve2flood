@@ -762,8 +762,16 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, E, B, nrows, ncols, sd, TW_m, d
         elif COMID_Averaging_Method!=0 or W_Rast[r-1,c-1]<0.001 or T_Rast[r-1,c-1]<0.00001:
             #Get COMID, TopWidth, and Depth Information for this cell
             COMID_Value = B[r,c]
-            COMID_TW_m = COMID_Unique_TW.get(COMID_Value, np.float32(0.0))
-            COMID_D = COMID_Unique_Depth.get(COMID_Value, np.float32(0.0))
+            # keys are int32, values are float32
+            if COMID_Value in COMID_Unique_TW:
+                COMID_TW_m = COMID_Unique_TW[COMID_Value]
+            else:
+                COMID_TW_m = np.float32(0.0)
+
+            if COMID_Value in COMID_Unique_Depth:
+                COMID_D = COMID_Unique_Depth[COMID_Value]
+            else:
+                COMID_D = np.float32(0.0)
             WSE = float(E[r_use,c_use] + COMID_D)
         else:
             #These are Based on the AutoRoute Results, not averaged for COMID
@@ -1113,10 +1121,6 @@ def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_F
 
     COMID_Unique_TW    = create_numba_dict_from(keys_tw,  vals_tw)
     COMID_Unique_Depth = create_numba_dict_from(keys_dep, vals_dep)
-    
-
-    # COMID_Unique_TW = create_numba_dict_from(np.asarray(list(COMID_Unique_TW.keys())), np.asarray(list(COMID_Unique_TW.values())))
-    # COMID_Unique_Depth = create_numba_dict_from(np.asarray(list(COMID_Unique_Depth.keys())), np.asarray(list(COMID_Unique_Depth.values())))
 
     Flood_array, Depth_array, WSE_array = CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, E, B, nrows, ncols, search_dist_for_min_elev, TopWidthMax, dx, dy, LocalFloodOption, COMID_Unique_TW, COMID_Unique_Depth, WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE)
     
@@ -1162,37 +1166,35 @@ def Flood_WaterLC_and_STRM_Cells_in_Flood_Map(Flood_Ensemble, S, LandCoverFile, 
 
     return Flood_Ensemble
 
-def Flood_Flooded_Cells_in_Depth_and_WSE_Map(Depth_or_WSE_Ensemble, Flood_Ensemble):
-    # Accept all non-NaN values as valid
-    source_mask =  (Flood_Ensemble > 0) & (Depth_or_WSE_Ensemble != 0)
-    target_mask = (Flood_Ensemble > 0) & (Depth_or_WSE_Ensemble == 0)
-    
-    # If there are no source cells, return as is
-    if not np.any(source_mask):
-        return Depth_or_WSE_Ensemble
+def Flood_Flooded_Cells_in_Depth_and_WSE_Map(Depth_or_WSE_Ensemble, Flood_Ensemble, eps=0.01):
 
-    # Use distance transform to find nearest valid cell
-    distance, (nearest_y, nearest_x) = distance_transform_edt(~source_mask, return_indices=True)
+    # valid sources are flooded cells with a real (non-NaN) value
+    source_mask =  (Flood_Ensemble > 0) & (~np.isnan(Depth_or_WSE_Ensemble))
+    # targets are flooded cells that are currently NaN
+    target_mask = (Flood_Ensemble > 0) & (np.isnan(Depth_or_WSE_Ensemble))
 
     # Copy to avoid modifying original array (optional)
     filled = Depth_or_WSE_Ensemble.copy()
-    filled[target_mask] = Depth_or_WSE_Ensemble[nearest_y[target_mask], nearest_x[target_mask]]
 
-    # # Recalculate the source mask and target mask and fill any remaining NaN values with 0.01 m
-    # source_mask = (~np.isnan(Flood_Ensemble)) & (~np.isnan(filled))
-    # target_mask = (~np.isnan(Flood_Ensemble)) & (np.isnan(filled))
-    # if np.any(target_mask):
-    #     # Fill remaining NaN values with 0.01 m
-    #     filled[target_mask] = 0.01
+    # find the closest depth or WSE values from valid source cells
+    if np.any(source_mask):
+        # EDT returns indices of the nearest ZERO in the input,
+        # so pass the inverse to point toward TRUE source cells.
+        _, (ny, nx) = distance_transform_edt(~source_mask, return_indices=True)
+        # nearest neighbor values from donors
+        nn_vals = Depth_or_WSE_Ensemble[ny, nx]
+        filled[target_mask] = nn_vals[target_mask]
 
-    # # Recalculate the source mask and target mask and fill any 0 values in the target mask with 0.01 m
-    # source_mask = (~np.isnan(Flood_Ensemble)) & (~np.isnan(filled))
-    # target_mask = (~np.isnan(Flood_Ensemble)) & (filled == 0.0)
-    # if np.any(target_mask):
-    #     # Fill remaining 0 values with 0.01 m
-    #     filled[target_mask] = 0.01
+    # If anything inside Flood_Ensemble is STILL NaN, give it a tiny positive depth
+    # (this happens when a flooded blob has zero donors anywhere)
+    still_nan = (Flood_Ensemble > 0) & np.isnan(filled)
+    if np.any(still_nan):
+        filled[still_nan] = eps
 
-    return filled
+    # keep everything outside Flood_Ensemble as NaN
+    filled[(Flood_Ensemble <= 0) & (~np.isnan(filled))] = np.nan
+    
+    return filled    
 
 def remove_cells_not_connected(flood_array: np.ndarray, streams_array: np.ndarray) -> np.ndarray:
     """
@@ -1264,7 +1266,7 @@ def ReadInputFile(lines,P):
 def create_depth_or_wse(
     num_flows: int,
     array_list: list[np.ndarray],
-    out_array: np.ndarray,
+    Flood_Ensemble: np.ndarray,
     streams: np.ndarray,
     geotransform: tuple,
     projection: str,
@@ -1281,18 +1283,19 @@ def create_depth_or_wse(
     valid_count = np.sum(~np.isnan(array_list), axis=0)
 
     # Avoid divide-by-zero; initialize with NaN where no valid members
-    avg = np.full_like(out_array, np.nan, dtype=np.float32)
+    avg = np.full_like(Flood_Ensemble, np.nan, dtype=np.float32)
     np.divide(sum_arr, valid_count, out=avg, where=(valid_count > 0))
 
     # Optional rounding (match your original 0.01 precision)
     avg = np.round(avg, 2)
 
     # Your domain-specific masks
-    avg = Flood_Flooded_Cells_in_Depth_and_WSE_Map(avg, out_array)
-    avg = remove_cells_not_connected(avg, streams)
+    avg = Flood_Flooded_Cells_in_Depth_and_WSE_Map(avg, Flood_Ensemble)
+    # avg = remove_cells_not_connected(avg, streams)
+
 
     # Treat tiny values as no water; convert to NaN first
-    avg[np.isclose(avg, 0.0, atol=1e-6)] = np.float32('nan')
+    # avg[np.isclose(avg, 0.0, atol=1e-6)] = np.float32('nan')
 
     # Replace NaN with numeric NoData sentinel for safer downstream handling
     out_band_data = np.where(np.isnan(avg), nodata_value, avg).astype(np.float32)
