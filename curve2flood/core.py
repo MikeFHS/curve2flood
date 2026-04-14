@@ -5083,7 +5083,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
     StrmShp_File = ReadInputFile(lines,'StrmShp_File')
     Make_Output_GPKG = ReadInputFile(lines,'Make_Output_GPKG')
     Flow_Direction_File = ReadInputFile(lines,'Flow_Direction_File')
-    Flow_Accumulation_File = ReadInputFile(lines,'Flow_Accumulation_File')
     StrmOrder_Field = ReadInputFile(lines,'StrmOrder_Field')
     Downstream_Link_Field = ReadInputFile(lines,'Downstream_Link_Field')
     Flood_File = ReadInputFile(lines,'OutFLD')
@@ -5200,18 +5199,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
             FlowDir[1:-1, 1:-1] = FDR.astype(np.int32)
     else:
         FlowDir = np.empty((3, 3), dtype=np.int32)  # dummy array to avoid errors downstream; won't be used if flow direction file is missing
-
-    if Flow_Accumulation_File and mapper == "Curve2Flood-FLDPLNpy":
-        (FAC, fac_ncols, fac_nrows, _, _, _, _, _, _, _, _) = Read_Raster_GDAL(Flow_Accumulation_File)
-        if fac_ncols != ncols or fac_nrows != nrows:
-            LOG.warning("Flow accumulation raster size does not match DEM; flow-accumulation input will be ignored.")
-            FlowAcc = np.zeros((nrows+2, ncols+2), dtype=np.float32)
-        else:
-            FlowAcc = np.zeros((nrows+2, ncols+2), dtype=np.float32)
-            FlowAcc[1:-1, 1:-1] = FAC.astype(np.float32)
-    else:
-        FlowAcc = np.empty((3, 3), dtype=np.float32)  # dummy array to avoid errors downstream; won't be used if flow direction file is missing
-
 
     LOG.info("Executing flood mapping logic...")
 
