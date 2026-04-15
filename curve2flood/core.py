@@ -737,10 +737,7 @@ def Get_Raster_Details(DEM_File):
     return minx, miny, maxx, maxy, dx, dy, ncols, nrows, geoTransform, Rast_Projection
 
 def Read_Raster_GDAL(InRAST_Name):
-    try:
-        dataset = gdal.Open(InRAST_Name, gdal.GA_ReadOnly)
-    except RuntimeError:
-        sys.exit(" ERROR: Field Raster File cannot be read!")
+    dataset = gdal.Open(InRAST_Name, gdal.GA_ReadOnly)
 
     # Retrieve dimensions and geospatial metadata.
     geotransform = dataset.GetGeoTransform()
