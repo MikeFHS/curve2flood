@@ -5334,8 +5334,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
 
     # If Flood_WaterLC_and_STRM_Cells or OutVEL is selected, we need to read in the Land Cover Raster
     if Flood_WaterLC_and_STRM_Cells or OutVEL:
-        if LC_array is None:
-            (LC_array, ncols, nrows, cellsize, yll, yur, xll, xur, lat, lc_geotransform, lc_projection) = Read_Raster_GDAL(LAND_File)
+        (LC_array, ncols, nrows, cellsize, yll, yur, xll, xur, lat, lc_geotransform, lc_projection) = Read_Raster_GDAL(LAND_File)
 
     # If selected, we can also flood cells based on the Land Cover and the Stream Raster
     if Flood_WaterLC_and_STRM_Cells:
