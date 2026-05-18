@@ -1,4 +1,4 @@
-
+﻿
 #This code looks at a DEM raster to find the dimensions, then writes a script to create a STRM raster.
 # built-in imports
 import json
@@ -23,6 +23,7 @@ from numba import njit, prange
 from numba.core import types
 from numba.typed import Dict
     
+import yaml
 import numpy as np
 import pandas as pd
 from pyproj import CRS, Geod
@@ -5063,7 +5064,12 @@ def Curve2Flood_MainFunction(input_file: str = None,
     if input_file:
         #Open the Input File
         with open(input_file,'r') as infile:
-            lines = infile.readlines()
+            if input_file.lower().endswith(('.yaml', '.yml')):
+                # If it's a YAML file, parse it with PyYAML and convert to the expected list of lines format
+                data = yaml.safe_load(infile)
+                lines = [f"{key}\t{value}\n" for key, value in data.items()]
+            else:
+                lines = infile.readlines()
     elif args:
         # Use the args dictionary to extract parameters
         # Hacky way to convert args to lines

@@ -5,6 +5,7 @@ gdal
 fastparquet
 rasterio
 geopandas
+pyyaml
 shapely
 scipy
 tqdm
