@@ -19,6 +19,7 @@ setup(
         "fastparquet",
         "rasterio",
         "geopandas",
+        "pyyaml",
         "shapely",
         "scipy",
         "numba",

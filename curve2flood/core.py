@@ -1,4 +1,4 @@
-
+﻿
 #This code looks at a DEM raster to find the dimensions, then writes a script to create a STRM raster.
 # built-in imports
 import json
@@ -23,6 +23,7 @@ from numba import njit, prange
 from numba.core import types
 from numba.typed import Dict
     
+import yaml
 import numpy as np
 import pandas as pd
 from pyproj import CRS, Geod
@@ -438,19 +439,13 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
     # Create dicts
     COMID_Unique_TW = comid_result_df.set_index('COMID')['TopWidth'].to_dict()
     COMID_Unique_Depth = comid_result_df.set_index('COMID')['Depth'].to_dict()
-    COMID_Unique_Velocity = comid_result_df.set_index('COMID')['Velocity'].to_dict()
-    COMID_Unique_WSE_Mean = comid_wse_stats.set_index('COMID')['mean'].astype(np.float32).to_dict()
-    COMID_Unique_WSE_Std = comid_wse_stats.set_index('COMID')['std'].astype(np.float32).to_dict()
-    
+
     # Get the maximum TopWidth for all COMIDs
     TopWidthMax = comid_result_df['TopWidth'].max()
 
     return (
         COMID_Unique_TW,
         COMID_Unique_Depth,
-        COMID_Unique_Velocity,
-        COMID_Unique_WSE_Mean,
-        COMID_Unique_WSE_Std,
         TopWidthMax,
         T_Rast,
         W_Rast,
@@ -690,17 +685,6 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
     # Create dicts
     COMID_Unique_TW = comid_result_df.set_index('COMID')['TopWidth'].to_dict()
     COMID_Unique_Depth = comid_result_df.set_index('COMID')['Depth'].to_dict()
-    COMID_Unique_Velocity = comid_result_df.set_index('COMID')['Velocity'].to_dict()
-    COMID_Unique_WSE_Mean = comid_wse_stats.set_index('COMID')['mean'].astype(np.float32).to_dict()
-    COMID_Unique_WSE_Std = comid_wse_stats.set_index('COMID')['std'].astype(np.float32).to_dict()
-
-    # build COMID -> TW (cells) mapping for fast array lookup later.
-    comid_result_df['TW_Cells'] = np.round(comid_result_df['TopWidth'] / np.minimum(dx, dy)).astype(int)
-    COMID_TW_Cell_Dict = comid_result_df.set_index('COMID')['TW_Cells'].to_dict()
-    # drop the TW_Cells column since it is only used for TW lookup
-    comid_result_df = comid_result_df.drop(columns=['TW_Cells'])
-    # weightboxes will be created on-demand inside CreateSimpleFloodMap
-    COMID_WeightBox_Dict = {}
 
     # Get the maximum TopWidth for all COMIDs
     TopWidthMax = comid_result_df['TopWidth'].max()
@@ -708,15 +692,10 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
     return (
         COMID_Unique_TW,
         COMID_Unique_Depth,
-        COMID_Unique_Velocity,
-        COMID_Unique_WSE_Mean,
-        COMID_Unique_WSE_Std,
         TopWidthMax,
         T_Rast,
         W_Rast,
-        S_Rast,
-        COMID_TW_Cell_Dict,
-        COMID_WeightBox_Dict
+        S_Rast
     )
   
 def Get_Raster_Details(DEM_File):
@@ -4417,19 +4396,17 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFi
         TopWidthMax = TopWidthPlausibleLimit 
     #Mike switched to default to VDT Database instead of Curve.  We can change this in the future.
     elif len(VDTDatabaseFileName)>1:
-        (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, COMID_Unique_WSE_Mean, 
-         COMID_Unique_WSE_Std, TopWidthMax, T_Rast, W_Rast, S_Rast, COMID_TW_Cell_Dict, COMID_WeightBox_Dict) = Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, 
+        (COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, 
                                                                                                                 T_Rast, W_Rast, S_Rast, TW_MultFact, fast_vdt, dx, dy)
     elif len(CurveParamFileName)>1:  
-        (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, COMID_Unique_WSE_Mean, 
-         COMID_Unique_WSE_Std, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName, COMID_Unique_Flow, COMID_Unique,  T_Rast, W_Rast, S_Rast, TW_MultFact, dx, dy)
+        (COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName, COMID_Unique_Flow, COMID_Unique,  T_Rast, W_Rast, S_Rast, TW_MultFact, dx, dy)
 
     LOG.info('Maximum Top Width = ' + str(TopWidthMax))
     
     if not quiet:
         for idx, comid in enumerate(COMID_Unique):
             if COMID_Unique_TW[comid]>TopWidthPlausibleLimit:
-                LOG.warning(f"Ignoring {comid}  {COMID_Unique_Flow[comid]}  {COMID_Unique_Flow[comid]*Q_Fraction}  {COMID_Unique_Depth[comid]}  {COMID_Unique_TW[comid]}  {COMID_Unique_Velocity[comid]}")  
+                LOG.warning(f"Ignoring {comid}  {COMID_Unique_Flow[comid]}  {COMID_Unique_Flow[comid]*Q_Fraction}  {COMID_Unique_Depth[comid]}  {COMID_Unique_TW[comid]}")  
 
     if TopWidthPlausibleLimit < TopWidthMax:
         TopWidthMax = TopWidthPlausibleLimit
@@ -4439,7 +4416,7 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFi
     Y_cells = np.round(TopWidthMax/dy,0)
     TW = int(max(Y_cells,X_cells))  #This is how many cells we will be looking at surrounding our stream cell
     
-    return COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, COMID_Unique_WSE_Mean, COMID_Unique_WSE_Std, TopWidthMax, TW, T_Rast, W_Rast, S_Rast, COMID_TW_Cell_Dict, COMID_WeightBox_Dict
+    return COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, TW, T_Rast, W_Rast, S_Rast
 
 def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, 
                 COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, 
@@ -4453,9 +4430,8 @@ def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
         
     # Calculate an Average Top Width and Depth for each stream reach.
     # The Depths are purposely adjusted to the DEM that you are using (this addresses issues with using the original or bathy dem)
-    (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, 
-     COMID_Unique_WSE_Mean, COMID_Unique_WSE_Std, TopWidthMax, 
-     TW, T_Rast, W_Rast, S_Rast, COMID_TW_Cell_Dict, COMID_WeightBox_Dict) = Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFileName, COMID_Unique_Flow, 
+    (COMID_Unique_TW, COMID_Unique_Depth,  TopWidthMax, 
+     TW, T_Rast, W_Rast, S_Rast) = Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFileName, COMID_Unique_Flow, 
                                                                                            COMID_Unique, Q_Fraction, T_Rast, W_Rast, S_Rast, TW_MultFact, 
                                                                                            TopWidthPlausibleLimit, dx, dy, Set_Depth, quiet, fast_vdt, 
                                                                                            linkno_to_twlimit=linkno_to_twlimit)
@@ -4471,19 +4447,8 @@ def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
     vals_tw  = np.asarray(list(COMID_Unique_TW.values()), dtype=np.float32)
     keys_dep = np.asarray(list(COMID_Unique_Depth.keys()), dtype=np.int32)
     vals_dep = np.asarray(list(COMID_Unique_Depth.values()), dtype=np.float32)
-    keys_vel = np.asarray(list(COMID_Unique_Velocity.keys()), dtype=np.int32)
-    vals_vel = np.asarray(list(COMID_Unique_Velocity.values()), dtype=np.float32)
-    keys_wse = np.asarray(list(COMID_Unique_WSE_Mean.keys()), dtype=np.int32)
-    vals_wse_mean = np.asarray(list(COMID_Unique_WSE_Mean.values()), dtype=np.float32)
-    vals_wse_std = np.asarray(list(COMID_Unique_WSE_Std.values()), dtype=np.float32)
-    keys_tw_cell = np.asarray(list(COMID_TW_Cell_Dict.keys()), dtype=np.int32)
-    vals_tw_cell = np.asarray(list(COMID_TW_Cell_Dict.values()), dtype=np.int32)
     COMID_Unique_TW    = create_numba_dict_from(keys_tw,  vals_tw)
     COMID_Unique_Depth = create_numba_dict_from(keys_dep, vals_dep)
-    COMID_Unique_Velocity = create_numba_dict_from(keys_vel, vals_vel)
-    COMID_Unique_WSE_Mean = create_numba_dict_from(keys_wse, vals_wse_mean)
-    COMID_Unique_WSE_Std = create_numba_dict_from(keys_wse, vals_wse_std)
-    COMID_TW_Cell_Dict = create_numba_dict_from_int32(keys_tw_cell, vals_tw_cell)
 
 
     # we need to compute stream ownership if we are using FLDPLN
@@ -5063,7 +5028,12 @@ def Curve2Flood_MainFunction(input_file: str = None,
     if input_file:
         #Open the Input File
         with open(input_file,'r') as infile:
-            lines = infile.readlines()
+            if input_file.lower().endswith(('.yaml', '.yml')):
+                # If it's a YAML file, parse it with PyYAML and convert to the expected list of lines format
+                data = yaml.safe_load(infile)
+                lines = [f"{key}\t{value}\n" for key, value in data.items()]
+            else:
+                lines = infile.readlines()
     elif args:
         # Use the args dictionary to extract parameters
         # Hacky way to convert args to lines
