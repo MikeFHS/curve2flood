@@ -203,7 +203,7 @@ def create_velocity(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_array_lis
     driver = gdal.GetDriverByName("GTiff")
     ds: gdal.Dataset = driver.Create(
         OutVEL, ncols, nrows, 1, gdal.GDT_Float32,
-        options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"]
+        options=["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES"]
     )
     if ds is None:
         raise RuntimeError(f"Failed to create output raster: {OutVEL}")
@@ -752,7 +752,7 @@ def Write_Output_Raster(s_output_filename, raster_data, ncols, nrows, dem_geotra
     #o_metadata = o_driver.GetMetadata()
 
     if creation_options is None:
-        creation_options = ["COMPRESS=DEFLATE", 'PREDICTOR=2']
+        creation_options = ["COMPRESS=LZW", 'PREDICTOR=2']
     
     # Construct the file with the appropriate data shape
     o_output_file = o_driver.Create(s_output_filename, xsize=ncols, ysize=nrows, bands=1, eType=s_output_type, options=creation_options)    
@@ -5266,7 +5266,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
         LOG.info('Creating Ensemble Flood Map...' + str(Flood_File))
 
     # Write the output raster
-    out_ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(Flood_File, ncols, nrows, 1, gdal.GDT_Byte, options=["COMPRESS=DEFLATE", "PREDICTOR=2"])
+    out_ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(Flood_File, ncols, nrows, 1, gdal.GDT_Byte, options=["COMPRESS=LZW", "PREDICTOR=2"])
     out_ds.SetGeoTransform(dem_geotransform)
     out_ds.SetProjection(dem_projection)
     out_ds.WriteArray(Flood_Ensemble)
@@ -5284,7 +5284,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
             # --- Write GeoTIFF ---
             ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(
                 OutDEP, ncols, nrows, 1, gdal.GDT_Float32,
-                options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"]
+                options=["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES"]
             )
             if ds is None:
                 raise RuntimeError(f"Failed to create output raster: {OutDEP}")
@@ -5310,7 +5310,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
         driver = gdal.GetDriverByName("GTiff")
         ds: gdal.Dataset = driver.Create(
             OutWSE, ncols, nrows, 1, gdal.GDT_Float32,
-            options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"]
+            options=["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES"]
         )
         if ds is None:
             raise RuntimeError(f"Failed to create output raster: {OutWSE}")
