@@ -12,11 +12,13 @@ try:
     import gdal 
     import osr 
     import ogr
+    import gdal_array
     #from gdalconst import GA_ReadOnly
 except: 
     from osgeo import gdal
     from osgeo import osr
     from osgeo import ogr
+    from osgeo import gdal_array
     #from osgeo.gdalconst import GA_ReadOnly
 
 from numba import njit, prange
@@ -32,15 +34,113 @@ import geopandas as gpd
 from scipy.ndimage import label, generate_binary_structure, distance_transform_edt
 from scipy.spatial import cKDTree
 from shapely.geometry import Point, shape
-import rasterio
-from rasterio.features import rasterize
-from rasterio.transform import Affine
 from curve2flood import LOG
 
 gdal.UseExceptions()
 
 COMID_FLOW_DICT_TYPE = dict[np.int32, np.float32]
 ID_SYNONYMS = ["COMID", "RIVID", "river_id", "LINKNO"]
+GeoTransform = tuple[float, float, float, float, float, float]
+
+def _normalize_geotransform(transform) -> GeoTransform:
+    """
+    Return a GDAL geotransform tuple.
+
+    Accepts native GDAL tuples and Affine-like objects that expose `to_gdal()`.
+    """
+    if hasattr(transform, "to_gdal"):
+        values = tuple(float(v) for v in transform.to_gdal())
+    else:
+        values = tuple(float(v) for v in transform)
+    if len(values) != 6:
+        raise ValueError(f"Expected a 6-element geotransform, received {len(values)} values.")
+    return values
+
+def _numpy_dtype_from_output_type(output_type) -> np.dtype:
+    if isinstance(output_type, int):
+        np_type = gdal_array.GDALTypeCodeToNumericTypeCode(output_type)
+        if np_type is None:
+            raise TypeError(f"Unsupported GDAL output type: {output_type}")
+        return np.dtype(np_type)
+    return np.dtype(output_type)
+
+def _gdal_dtype_from_output_type(output_type) -> int:
+    if isinstance(output_type, int):
+        return int(output_type)
+    np_dtype = np.dtype(output_type)
+    if np_dtype == np.dtype(bool):
+        return int(gdal.GDT_Byte)
+    gdal_type = gdal_array.NumericTypeCodeToGDALTypeCode(np_dtype)
+    if gdal_type is None:
+        raise TypeError(f"Unsupported NumPy output type: {output_type}")
+    return int(gdal_type)
+
+def rasterize_shapes_gdal(
+    shapes,
+    out_shape: tuple[int, int],
+    transform,
+    fill=0,
+    dtype=np.uint8,
+    all_touched: bool = False,
+    projection_wkt: str | None = None,
+) -> np.ndarray:
+    """
+    Rasterize shapely geometries to a NumPy array using GDAL.
+    """
+    geotransform = _normalize_geotransform(transform)
+    np_dtype = _numpy_dtype_from_output_type(dtype)
+    gdal_dtype = _gdal_dtype_from_output_type(dtype)
+
+    raster_driver = gdal.GetDriverByName("MEM")
+    raster_ds = raster_driver.Create("", xsize=int(out_shape[1]), ysize=int(out_shape[0]), bands=1, eType=gdal_dtype)
+    raster_ds.SetGeoTransform(geotransform)
+    if projection_wkt:
+        raster_ds.SetProjection(str(projection_wkt))
+
+    band = raster_ds.GetRasterBand(1)
+    band.WriteArray(np.full(out_shape, fill, dtype=np_dtype))
+
+    vector_driver = ogr.GetDriverByName("MEM") or ogr.GetDriverByName("Memory")
+    vector_ds = vector_driver.CreateDataSource("")
+    layer_srs = None
+    if projection_wkt:
+        layer_srs = osr.SpatialReference()
+        layer_srs.ImportFromWkt(str(projection_wkt))
+    layer = vector_ds.CreateLayer("shapes", srs=layer_srs, geom_type=ogr.wkbUnknown)
+
+    field_name = "burn"
+    layer.CreateField(ogr.FieldDefn(field_name, ogr.OFTReal))
+    layer_defn = layer.GetLayerDefn()
+
+    feature_count = 0
+    for geom, value in shapes:
+        if geom is None or value is None:
+            continue
+        if hasattr(geom, "is_empty") and geom.is_empty:
+            continue
+        if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+            continue
+        shapely_geom = geom if hasattr(geom, "wkb") else shape(geom)
+        ogr_geom = ogr.CreateGeometryFromWkb(shapely_geom.wkb)
+        feature = ogr.Feature(layer_defn)
+        feature.SetField(field_name, float(value))
+        feature.SetGeometry(ogr_geom)
+        layer.CreateFeature(feature)
+        feature = None
+        feature_count += 1
+
+    if feature_count > 0:
+        options = [f"ATTRIBUTE={field_name}"]
+        if all_touched:
+            options.append("ALL_TOUCHED=TRUE")
+        err = gdal.RasterizeLayer(raster_ds, [1], layer, options=options)
+        if err != 0:
+            raise RuntimeError(f"GDAL rasterization failed with error code {err}.")
+
+    array = band.ReadAsArray()
+    vector_ds = None
+    raster_ds = None
+    return np.asarray(array)
 
 def _parse_optional_bool(value, default: bool = False) -> bool:
     if value in (None, ""):
@@ -777,27 +877,25 @@ def Convert_GDF_to_Output_Raster(s_output_filename, gdf, Param, ncols, nrows, de
     # Rasterize geometries
     LOG.info('Rasterizing geometries')
     shapes = ((geom, value) for geom, value in zip(gdf.geometry, gdf[Param]))  # Replace 'value_column' with your column name
-    raster_data = rasterize(
+    raster_data = rasterize_shapes_gdal(
         shapes=shapes,
         out_shape=(nrows, ncols),
         transform=dem_geotransform,
-        fill=0,  # Value to use for areas not covered by geometries
-        dtype=s_output_type
+        fill=0,
+        dtype=s_output_type,
+        projection_wkt=dem_projection,
     )
     LOG.info('Writing output file')
-    # Write raster to file
-    with rasterio.open(
+    Write_Output_Raster(
         s_output_filename,
-        "w",
-        driver=s_file_format,
-        height=nrows,
-        width=ncols,
-        count=1,
-        dtype=s_output_type,
-        crs=gdf.crs.to_string(),  # Use the GeoDataFrame's CRS
-        transform=dem_geotransform,
-    ) as dst:
-        dst.write(raster_data, 1)
+        raster_data,
+        ncols,
+        nrows,
+        _normalize_geotransform(dem_geotransform),
+        dem_projection,
+        s_file_format,
+        s_output_type,
+    )
     return
 
 def Write_Output_Raster_As_GeoDataFrame(raster_data, ncols, nrows, dem_geotransform, dem_projection, s_output_type):
@@ -2608,7 +2706,7 @@ def _grid_xy_from_rc(rows: np.ndarray, cols: np.ndarray, dx: float, dy: float) -
     local projected grid measured in meters.
 
     The x axis increases to the right. The y axis is negative downward so the
-    generated Affine transform matches raster row indexing.
+    generated GDAL geotransform matches raster row indexing.
     """
     x = (cols.astype(np.float32) + np.float32(0.5)) * np.float32(dx)
     y = -((rows.astype(np.float32) + np.float32(0.5)) * np.float32(dy))
@@ -2813,7 +2911,7 @@ def build_variable_buffer_masks_from_points(
     y: np.ndarray,
     topwidth: np.ndarray,
     dem_shape: tuple[int, int],
-    transform: Affine,
+    transform: GeoTransform,
     fixed_corridor_buffer_m: float,
     fixed_anchor_buffer_m: float,
     use_topwidth_buffers: bool = True,
@@ -2847,8 +2945,20 @@ def build_variable_buffer_masks_from_points(
         corridor_shapes = ((geom.buffer(float(fixed_corridor_buffer_m)), 1) for geom in points)
         anchor_shapes = ((geom.buffer(float(fixed_anchor_buffer_m)), 1) for geom in points)
 
-    corridor = rasterize(corridor_shapes, out_shape=dem_shape, transform=transform, all_touched=False).astype(bool)
-    anchor = rasterize(anchor_shapes, out_shape=dem_shape, transform=transform, all_touched=False).astype(bool)
+    corridor = rasterize_shapes_gdal(
+        corridor_shapes,
+        out_shape=dem_shape,
+        transform=transform,
+        dtype=np.uint8,
+        all_touched=False,
+    ).astype(bool)
+    anchor = rasterize_shapes_gdal(
+        anchor_shapes,
+        out_shape=dem_shape,
+        transform=transform,
+        dtype=np.uint8,
+        all_touched=False,
+    ).astype(bool)
     return corridor, anchor
 
 def build_target_coordinates(xs: np.ndarray, ys: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -3198,7 +3308,7 @@ def create_fhs_flood_map_from_points(
         use_topwidth_max_distance = False
 
     nrows, ncols = dem.shape
-    transform = Affine(float(dx), 0.0, 0.0, 0.0, -float(dy), 0.0)
+    transform = (0.0, float(dx), 0.0, 0.0, 0.0, -float(dy))
     xs = (np.arange(ncols, dtype=np.float32) + np.float32(0.5)) * np.float32(dx)
     ys = -((np.arange(nrows, dtype=np.float32) + np.float32(0.5)) * np.float32(dy))
 
@@ -3260,7 +3370,7 @@ def create_fhs_flood_map_from_points(
         if point_ids is not None and use_topwidth_max_distance:
             tmp_df = pd.DataFrame({"id_col": point_ids[valid], "tw_based_dist": maxdist_topwidth_factor * tw_valid})
             grouped = tmp_df.groupby("id_col")["tw_based_dist"].median()
-            point_max_distance = tmp_df["id_col"].map(grouped).to_numpy(dtype=np.float32)
+            point_max_distance = tmp_df["id_col"].map(grouped).to_numpy(dtype=np.float32, copy=True)
             bad = ~np.isfinite(point_max_distance)
             point_max_distance[bad] = max_distance_m
         else:
@@ -4663,6 +4773,25 @@ def ReadInputFile(lines,P):
         return ""
 
     return ''
+
+def read_input_file(input_file: str) -> dict[str, str | bool | float]:
+    """
+    Compatibility wrapper that parses the whitespace-delimited input file into
+    a parameter dictionary.
+    """
+    with open(input_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    params: dict[str, str | bool | float] = {}
+    for line in lines:
+        ls = line.strip().split(None, 1)
+        if len(ls) > 1:
+            params[ls[0]] = ls[1]
+
+    for flag in ("LocalFloodOption", "FloodLocalOnly"):
+        if flag in params:
+            params[flag] = str(params[flag]).strip().lower() in ("true", "1", "yes", "y")
+    return params
 
 def read_geometry_and_get_linkno_mappings(StrmShp_File: str, 
                                  COMID_Unique, 

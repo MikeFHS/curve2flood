@@ -17,7 +17,6 @@ setup(
         "pandas",
         "gdal",
         "fastparquet",
-        "rasterio",
         "geopandas",
         "pyyaml",
         "shapely",
