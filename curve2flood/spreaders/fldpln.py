@@ -1,141 +1,315 @@
+from __future__ import annotations
+
+
 import numpy as np
+import pandas as pd
 from numba import njit, prange
 
-@njit(cache=True)
-def get_dr_dc_from_flowdir(flowdir_value):
-    if flowdir_value == 1:
-        return -1, 1
-    elif flowdir_value == 2:
-        return 0, 1
-    elif flowdir_value == 4:
-        return 1, 1
-    elif flowdir_value == 8:
-        return 1, 0
-    elif flowdir_value == 16:
-        return 1, -1
-    elif flowdir_value == 32:
-        return 0, -1
-    elif flowdir_value == 64:
-        return -1, -1
-    elif flowdir_value == 128:
-        return -1, 0
-    return 0, 0
+# Neighbor order used in the MATLAB code:
+# 1 2 3
+# 4 x 5
+# 6 7 8
+NEIGHBOR_DELTAS = (
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, -1),
+    (0, 1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+)
 
-@njit(cache=True)
-def get_d8():
-    # Whitebox D8 pointer encoding:
-    # 1=NE, 2=E, 4=SE, 8=S, 16=SW, 32=W, 64=NW, 128=N
-    return (
-        (-1, 0, 128),
-        ( 1, 0,   8),
-        ( 0, 1,   2),
-        ( 0,-1,  32),
-        (-1,-1, 64),
-        ( 1,-1, 16),
-        (-1, 1,  1),
-        ( 1, 1,  4),
-    )
+# Flow direction values in the MATLAB port's D8 convention.
+INFLOW = np.asarray([4, 8, 16, 2, 32, 1, 128, 64], dtype=np.int32)
+OUTFLOW = np.asarray([64, 128, 1, 32, 2, 16, 8, 4], dtype=np.int32)
 
-@njit(cache=True)
-def get_neighbor_offsets():
-    return ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))
+# MATLAB
+INFLOW = np.asarray([2, 4, 8, 1, 16, 128, 64, 32], dtype=np.int32)
+# OUTFLOW = np.asarray([32, 64, 128, 16, 1, 8, 4, 2], dtype=np.int32)
 
-@njit(cache=True)
-def backfill_and_identify_main_channel(streams: np.ndarray, flowdir: np.ndarray, WSE_Initial: np.ndarray, WSE_Out_stream: np.ndarray, E: np.ndarray, stream_id: int):
-    main_channel_not_in_stream = set()
-    nrows, ncols = streams.shape
-    MIN_FLOOD_DEPTH = 0.0
+# Whitebox D8
+# 64  128 1
+# 32  x   2
+# 16  8   4
 
-    # Process the seed catalog for this stream.
-    for sr in range(nrows):
-        for sc in range(ncols):
-            if streams[sr, sc] != stream_id:
+# ESRI D8
+# 32  64 128
+# 16  x   1
+# 8   4   2
+
+@njit(cache=True, nogil=True)
+def _pixel_to_rc(pixel: int, ncols: int) -> tuple[int, int]:
+    return pixel // ncols, pixel % ncols
+
+@njit(cache=True, nogil=True)
+def _rc_to_pixel(row: int, col: int, ncols: int) -> int:
+    return row * ncols + col
+
+@njit(cache=True, nogil=True)
+def _valid_neighbors(pixel: int, nrows: int, ncols: int):
+    row, col = _pixel_to_rc(pixel, ncols)
+    for pos, (dr, dc) in enumerate(NEIGHBOR_DELTAS):
+        rr = row + dr
+        cc = col + dc
+        if 0 <= rr < nrows and 0 <= cc < ncols:
+            yield (pos, _rc_to_pixel(rr, cc, ncols))
+
+@njit(cache=True, nogil=True)
+def _next_downstream(pixel: int, fdr: np.ndarray, nrows: int, ncols: int) -> int | None:
+    OUTFLOW = {
+        np.uint8(32): (-1, -1),
+        np.uint8(64): (-1, 0),
+        np.uint8(128): (-1, 1),
+        np.uint8(16): (0, -1),
+        np.uint8(1): (0, 1),
+        np.uint8(8): (1, -1),
+        np.uint8(4): (1, 0),
+        np.uint8(2): (1, 1),
+    }
+
+    fd = fdr[pixel]
+    if fd == 0:
+        return None
+
+    row, col = _pixel_to_rc(pixel, ncols)
+    dr, dc = OUTFLOW[fd]
+    rr = row + dr
+    cc = col + dc
+    if rr < 0 or rr >= nrows or cc < 0 or cc >= ncols:
+        return None
+    return _rc_to_pixel(rr, cc, ncols)
+
+def _segment_pixels_matlab(seg_id: int, seg_info: np.ndarray, fdr: np.ndarray,
+                    nrows: int, ncols: int) -> list[int]:
+    """Return stream pixels for a segment id. The seed-point path is not ported."""
+    row_idx = int(seg_id)
+    if row_idx < 0 or row_idx >= seg_info.shape[0]:
+        raise IndexError("seg0 is outside seg_info.")
+
+    start = round(seg_info[row_idx, 0])
+    length = round(seg_info[row_idx, 4])
+
+    if length <= 0:
+        return []
+
+    pixels = [start]
+    current = start
+    for _ in range(1, length):
+        nxt = _next_downstream(current, fdr, nrows, ncols)
+        if nxt is None:
+            break
+        pixels.append(nxt)
+        current = nxt
+    return pixels
+
+
+def _downstream_exclusion_matlab(seg_id: int, seg_info: np.ndarray, fdr: np.ndarray,
+                          nrows: int, ncols: int) -> set[int]:
+    """Pixels downstream of the segment end, excluded from spillover candidates."""
+    row_idx = int(seg_id)
+    end_pixel = int(seg_info[row_idx, 1])
+
+    excluded: set[int] = set()
+    current = end_pixel
+    seen = {current}
+    while True:
+        nxt = _next_downstream(current, fdr, nrows, ncols)
+        if nxt is None or nxt in seen:
+            break
+        excluded.add(nxt)
+        seen.add(nxt)
+        current = nxt
+
+def _segment_pixels(stream_id: int, stream_info: np.ndarray, fdr: np.ndarray, nrows: int, ncols: int) -> list[int]:
+    """Return stream pixels for a segment id. The seed-point path is not ported."""
+    row = stream_info[stream_info[:, 3] == stream_id, [0, 2]]
+    start = row[0]
+    length = row[1]
+    # row = stream_info.iloc[1]
+    # if row.empty:
+    #     raise ValueError("stream_id not found in stream_info.")
+
+    # start = round(row.iat[0, 0])
+    # length = round(row.iat[0, 2])
+    # length = round(row.iat[0, 4])
+    # start = round(row.iat[0])
+    # length = round(row.iat[4])
+
+    if length <= 0:
+        return []
+
+    pixels = [start]
+    current = start
+    for _ in range(1, length):
+        nxt = _next_downstream(current, fdr, nrows, ncols)
+        if nxt is None:
+            break
+        pixels.append(nxt)
+        current = nxt
+    return pixels
+
+
+def _downstream_exclusion(stream_id: int, stream_info: np.ndarray, fdr: np.ndarray, nrows: int, ncols: int) -> set[int]:
+    """Pixels downstream of the segment end, excluded from spillover candidates."""
+    end_pixel = stream_info[stream_info[:, 3] == stream_id, 1][0]  # Assuming linkno is in the 4th column (index 3)
+    # row = stream_info.iloc[1]
+    # end_pixel = int(row[0, 1])
+    # end_pixel = int(row.iat[1])
+
+    excluded: set[int] = set()
+    current = end_pixel
+    seen = {current}
+    while True:
+        nxt = _next_downstream(current, fdr, nrows, ncols)
+        if nxt is None or nxt in seen:
+            break
+        excluded.add(nxt)
+        seen.add(nxt)
+        current = nxt
+
+    return excluded
+
+
+def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
+                          fil: np.ndarray, fdr: np.ndarray, nrows: int, ncols: int,
+                          bg: float, flood_members: set[int] | None = None,
+                          excluded: set[int] | None = None) -> list[tuple[int, float]]:
+    """
+    Backfill opposite the D8 flow direction from `source`.
+
+    Returned DTF values include `base_dtf`. When `flood_members` is supplied,
+    pixels already in the floodplain are not returned; this matches the first
+    backfill pass in the MATLAB code. Spillover backfill passes leave it as None
+    so existing pixels can be overwritten when the new DTF is lower.
+    """
+    source_elev = fil[source]
+    result: list[tuple[int, float]] = []
+    queue: list[int] = [source]
+    visited = {source}
+    excluded = excluded or set()
+
+    while queue:
+        center = queue.pop()
+        for pos, nbr in _valid_neighbors(center, nrows, ncols):
+            if nbr in visited or nbr in excluded:
                 continue
-
-            # Go downstream to find the main channel, not represented in the stream raster
-            rr = sr
-            cc = sc
-            while True:
-                dr, dc = get_dr_dc_from_flowdir(flowdir[rr, cc])
-                if dr == 0 and dc == 0:
-                    break
-                rr += dr
-                cc += dc
-                if not (0 <= rr < nrows and 0 <= cc < ncols):
-                    break
-                if streams[rr, cc] == stream_id:
-                    break
-                if (rr, cc) in main_channel_not_in_stream:
-                    break
-                main_channel_not_in_stream.add((rr, cc))
-
-            wse = WSE_Initial[sr, sc]
-            if np.isnan(wse) or wse <= -9998.0 or wse <= E[sr, sc] + MIN_FLOOD_DEPTH:
+            if flood_members is not None and nbr in flood_members:
                 continue
+            if fil[nbr] == bg or fil[nbr] > max_wse:
+                continue
+            if fdr[nbr] != INFLOW[pos]:
+                continue
+            dtf = base_dtf + max(0.0, fil[nbr] - source_elev)
+            visited.add(nbr)
+            result.append((nbr, dtf))
+            queue.append(nbr)
 
-            if np.isnan(WSE_Out_stream[sr, sc]) or wse > WSE_Out_stream[sr, sc]:
-                WSE_Out_stream[sr, sc] = wse
+    return result
 
-            # Start backfilling from this water elevation source cell
-            queue = [(sr, sc)]
+# @njit(cache=True, nogil=True)
+def _boundary(records: dict[int, tuple[int, float]], fil: np.ndarray,
+              nrows: int, ncols: int, bg: float) -> list[tuple[int, int, float]]:
+    out: list[tuple[int, int, float]] = []
+    for pixel, (fsp, dtf) in records.items():
+        if fil[pixel] == bg:
+            continue
+        for _, nbr in _valid_neighbors(pixel, nrows, ncols):
+            if nbr not in records and fil[nbr] != bg:
+                out.append((fsp, pixel, dtf))
+                break
+    out.sort(key=lambda x: (x[2], -fil[x[1]]))
+    return out
 
-            # Depth-first search (DFS) over reverse-flow neighbors.
-            while queue:
-                r, c = queue.pop()
 
-                for dr, dc, dir_value in get_d8():
-                    nr = r - dr
-                    nc = c - dc
+def _flood_map(records: dict[int, tuple[int, float]], flddat: np.ndarray, fldmn: float) -> None:
+    for pixel, (_, dtf) in records.items():
+        flddat[pixel] = max(fldmn, dtf)
 
-                    # Is the new cell a cell which flows into this one?
-                    if 0 <= nr < nrows and 0 <= nc < ncols and flowdir[nr, nc] == dir_value:
-                        # Is the new cell inundated by this stream cell?
-                        if E[nr, nc] > -9998.0 and E[nr, nc] + MIN_FLOOD_DEPTH <= wse:
-                            if np.isnan(WSE_Out_stream[nr, nc]) or wse >= WSE_Out_stream[nr, nc]:
-                                queue.append((nr, nc))
-                                WSE_Out_stream[nr, nc] = wse
 
-    return main_channel_not_in_stream
+def _spill_candidates(boundary: list[tuple[int, int, float]], records: dict[int, tuple[int, float]],
+                      flddat: np.ndarray, fil: np.ndarray, nrows: int, ncols: int,
+                      fldht: float, mxht: float, bg: float, excluded: set[int]) -> list[tuple[int, float, int, float, float]]:
+    best: dict[int, tuple[float, float, int, float, float]] = {}
+    for fsp, bdy_pixel, bdy_dtf in boundary:
+        bdy_elev = fil[bdy_pixel]
+        if bdy_elev == bg:
+            continue
+        limit = min(mxht, bdy_elev + fldht - bdy_dtf)
+        for _, nbr in _valid_neighbors(bdy_pixel, nrows, ncols):
+            if nbr in records or nbr in excluded:
+                continue
+            nbr_elev = fil[nbr]
+            if nbr_elev == bg or nbr_elev > limit:
+                continue
+            spill_dtf = bdy_dtf + max(0.0, nbr_elev - bdy_elev)
+            available_depth = fldht - bdy_dtf - max(0.0, nbr_elev - bdy_elev)
+            previous = best.get(nbr)
+            if previous is None:
+                best[nbr] = (available_depth, bdy_elev, fsp, spill_dtf, nbr_elev)
+            else:
+                old_available, old_bdy_elev, *_ = previous
+                if available_depth > old_available or (
+                    available_depth == old_available and bdy_elev > old_bdy_elev
+                ):
+                    best[nbr] = (available_depth, bdy_elev, fsp, spill_dtf, nbr_elev)
 
-@njit(cache=True)
-def sort_interior_boundary(lst: list):
-    # This is a numba-compatible sort, since numba cannot cache list.sort(key=lambda x: x[2]) or sorted(lst, key=lambda x: x[2])
-    def key_func(x):
-        return x[2]  # Sort by elevation (the third element of the tuple)
+    candidates = [
+        (fsp, spill_dtf, pixel, pixel_elev, bdy_elev)
+        for pixel, (_, bdy_elev, fsp, spill_dtf, pixel_elev) in best.items()
+    ]
+    candidates.sort(key=lambda x: (x[1], -x[4]))
+    return candidates
 
-    for i in range(1, len(lst)):
-        current_item = lst[i]
-        current_key = key_func(current_item)
-        j = i - 1
-        
-        while j >= 0 and key_func(lst[j]) > current_key:
-            lst[j + 1] = lst[j]
-            j -= 1
-        lst[j + 1] = current_item
-        
-    return lst
 
-@njit(cache=True)
-def sort_exterior_boundary(lst: list):
-    # This is a numba-compatible sort, since numba cannot cache list.sort(key=lambda x: x[2], x[3]) or sorted(lst, key=lambda x: x[2], x[3])
-    def key_func(x):
-        return x[2], x[3]  # Sort by spillover, than elevation
+def _forward_path(start: int, spill_dtf: float, fil: np.ndarray, fdr: np.ndarray,
+                  flddat: np.ndarray, nrows: int, ncols: int, bg: float,
+                  excluded: set[int]) -> list[int]:
+    path: list[int] = []
+    seen: set[int] = set()
+    current = start
+    while True:
+        if current in seen:
+            break
+        seen.add(current)
+        path.append(current)
+        nxt = _next_downstream(current, fdr, nrows, ncols)
+        if nxt is None:
+            break
+        if nxt in excluded:
+            path.append(nxt)
+            break
+        if fil[nxt] == bg:
+            break
+        if flddat[nxt] > 0 and spill_dtf >= flddat[nxt]:
+            break
+        current = nxt
+    return path
 
-    for i in range(1, len(lst)):
-        current_item = lst[i]
-        current_key = key_func(current_item)
-        j = i - 1
-        
-        while j >= 0 and key_func(lst[j]) < current_key:
-            lst[j + 1] = lst[j]
-            j -= 1
-        lst[j + 1] = current_item
-        
-    return lst
 
-@njit(cache=True, nogil=True, parallel=True)
-# @profile
-def fldpln(WSE_Initial: np.ndarray, E: np.ndarray, flowdir: np.ndarray, streams: np.ndarray, unique_stream_ids: np.ndarray):
+def _assimilate(records: dict[int, tuple[int, float]], fsp: int, pixel: int, dtf: float) -> bool:
+    old = records.get(pixel)
+    if old is None or old[1] > dtf:
+        records[pixel] = (fsp, dtf)
+        return True
+    return False
+
+
+import tqdm
+
+# @njit(cache=True, nogil=True, parallel=True)
+@profile
+def fldpln_library_for_segment(dem: np.ndarray,
+                               filled_dem: np.ndarray, 
+                               flow_direction: np.ndarray, 
+                               stream_id: int,
+                               stream_info: np.ndarray,
+                               dh: float,
+                               fldmn: float,
+                               fldmx: float,
+                               ssflg: bool,
+                               global_max_wse: float = 0.0,
+                               bg: float = -9999):
     """
     This function is meant to mimic the FLDPLN model developed at the University of Kansas, translated iteratively
     using Codex-ChatGPT and this repository: https://github.com/AlabamaWaterInstitute/fldpln and this documentation: 
@@ -163,302 +337,106 @@ def fldpln(WSE_Initial: np.ndarray, E: np.ndarray, flowdir: np.ndarray, streams:
 
     Returns WSE_Out or the WSE Array for a one set of streamflow inputs
     """
-    nrows, ncols = WSE_Initial.shape
-    # Initialize outputs: WSE_Out holds max WSE per cell, fsp holds source stream id, dtf holds first inundation stage.
-    WSE_Out = np.full((nrows, ncols), np.nan, dtype=np.float32)
+    if dh <= 0:
+        raise ValueError("dh must be positive.")
 
-    # create an empty array for this segments WSE and that will be blended at the end
-    WSE_Out_stream = np.full((nrows, ncols), np.nan, dtype=np.float32)
-    MIN_FLOOD_DEPTH = 0.0
+    nrows, ncols = dem.shape
+    if flow_direction.shape != (nrows, ncols):
+        raise ValueError("flow_direction shape must match filled_dem shape.")
+    if dem.shape != (nrows, ncols):
+        raise ValueError("dem shape must match filled_dem shape.")
 
-    # begin loop over stream ids in order of average WSE (lowest first)
-    for stream_id in unique_stream_ids:
-        # reset per-stream workspace
-        WSE_Out_stream[:] = np.nan
+    dem = dem.astype(np.float32, copy=False).ravel()
+    filled_dem = filled_dem.astype(np.float32, copy=False).ravel()
+    flow_direction = flow_direction.astype(np.uint8, copy=False).ravel()
 
-        main_channel_not_in_stream = backfill_and_identify_main_channel(streams, flowdir, WSE_Initial, WSE_Out_stream, E, stream_id)
+    global_max_wse = np.finfo(np.float32).max if not global_max_wse else 0.99999 * global_max_wse
+    strpts = _segment_pixels(stream_id, stream_info, flow_direction, nrows, ncols)
+    excluded = _downstream_exclusion(stream_id, stream_info, flow_direction, nrows, ncols)
 
-        ### now perform spillover and backfill for this stream before moving on to the next stream id ###
-        # Iterative spillover: boundary spill points -> upsteam and downstream spread using flowdir until steady-state.
+    records: dict[int, tuple[int, float]] = {}
+    for pixel in strpts:
+        if filled_dem[pixel] != bg:
+            records[pixel] = (pixel, 0.0)
 
-        # Build initial boundary queue of wet cells adjacent to dry cells (WSE_Out < E).
-        interior_boundary = []
-        all_interior_cells = set()
-        for r in range(nrows):
-            for c in range(ncols):
-                if np.isnan(WSE_Out_stream[r, c]):
+    fldht = 0.0
+    iterations = int(np.ceil(fldmx / dh))
+
+    flddat = np.zeros(filled_dem.size, dtype=np.float32)
+
+    for _ in tqdm.tqdm(range(iterations), desc="Processing floodplain"):
+        fldht += min(dh, fldmx - fldht)
+
+        bdy = _boundary(records, filled_dem, nrows, ncols, bg)
+        _flood_map(records, flddat, fldmn)
+        flood_members = set(records)
+
+        for fsp, boundary_pixel, boundary_dtf in bdy:
+            boundary_elev = filled_dem[boundary_pixel]
+            max_wse = min(global_max_wse, boundary_elev + fldht - boundary_dtf)
+            additions = _backfill_from_source(
+                boundary_pixel, boundary_dtf, max_wse, filled_dem, flow_direction, nrows, ncols,
+                bg, flood_members=flood_members
+            )
+            for pixel, dtf in additions:
+                if _assimilate(records, fsp, pixel, dtf):
+                    flddat[pixel] = max(fldmn, dtf)
+                    flood_members.add(pixel)
+
+        bdy = _boundary(records, filled_dem, nrows, ncols, bg)
+        spill = True
+        while spill:
+            before = len(records)
+            _flood_map(records, flddat, fldmn)
+            candidates = _spill_candidates(
+                bdy, records, flddat, filled_dem, nrows, ncols, fldht, global_max_wse, bg, excluded
+            )
+
+            for fsp, spill_dtf, pixel, pixel_elev, _ in candidates:
+                path = _forward_path(pixel, spill_dtf, filled_dem, flow_direction, flddat, nrows, ncols, bg, excluded)
+                if not path:
                     continue
+                path_set = set(path)
+                path_stage = min(global_max_wse, pixel_elev + fldht - spill_dtf)
+                path_depth = path_stage - pixel_elev
 
-                if E[r, c] < -9998.0 or (WSE_Out_stream[r, c] - E[r, c]) <= MIN_FLOOD_DEPTH:
-                    continue
+                pending: list[tuple[int, float]] = [(p, 0.0) for p in path]
+                for source in path:
+                    source_wse = filled_dem[source] + path_depth
+                    pending.extend(
+                        _backfill_from_source(
+                            source, 0.0, source_wse, filled_dem, flow_direction, nrows, ncols,
+                            bg, flood_members=None, excluded=path_set
+                        )
+                    )
 
-                for dr, dc in get_neighbor_offsets():
-                    nr = r + dr
-                    nc = c + dc
-                    if np.isnan(WSE_Out_stream[nr, nc]) or (WSE_Out_stream[nr, nc] - E[nr, nc]) <= MIN_FLOOD_DEPTH:
-                        interior_boundary.append((r, c, E[r, c]))
-                        all_interior_cells.add((r, c))
-                        break
+                for new_pixel, local_dtf in pending:
+                    _assimilate(records, fsp, new_pixel, local_dtf + spill_dtf)
 
-        if not interior_boundary:
-            continue
-
-        # For performance, let's sort the interior boundary by increasing elevation
-        interior_boundary = sort_interior_boundary(interior_boundary)
-        interior_boundary = [(r, c) for r, c, elev in interior_boundary]  # we only need the coordinates for the spillover loop
-
-        # Plot the interior boundary for debugging
-        # import matplotlib.pyplot as plt
-        # plt.figure(figsize=(10, 6))
-        # plt.imshow(WSE_Out_stream, cmap='terrain')
-        # boundary_rows, boundary_cols = zip(*interior_boundary)
-        # plt.scatter(boundary_cols, boundary_rows, color='red', s=1)
-        # plt.title('Interior Boundary Cells (Red) on Elevation Map')
-        # plt.xlabel('Column Index')
-        # plt.ylabel('Row Index')
-        # # plt.gca().invert_yaxis()
-        # plt.show()
-
-        spill_changed = True
-        while spill_changed:
-            new_interior_boundary = set()
-            spill_changed = False
-                        
-            if len(interior_boundary) == 0:
-                # End the loop because we don't have spillover candidates.
-                break
-
-            exterior_boundary = {}
-
-                
-            # Identify spillover candidates by minimum depth from wet neighbors.
-            while interior_boundary:
-                r, c = interior_boundary.pop()
-                # Plot a 10x10 grid of the DEM
-                # import matplotlib.pyplot as plt
-                # plt.imshow(E[max(r-10, 0):min(r+10, nrows), max(c-10, 0):min(c+10, ncols)], cmap='terrain')
-                # plt.colorbar(label='Elevation')
-                # plt.title(f'10x10 DEM around Interior Boundary Cell ({r}, {c})')
-                # plt.xlabel('Column Index')
-                # plt.ylabel('Row Index')
-                # plt.show()
-
-                # plt.imshow(WSE_Out_stream[max(r-10, 0):min(r+10, nrows), max(c-10, 0):min(c+10, ncols)], cmap='Blues')
-                # plt.colorbar(label='WSE_Out_stream')
-                # plt.title(f'10x10 WSE_Out_stream around Interior Boundary Cell ({r}, {c})')
-                # plt.xlabel('Column Index')
-                # plt.ylabel('Row Index')
-                # plt.show()
-            
-                # the wet cell elevation
-                wet_cell_elev = E[r, c]
-                if wet_cell_elev <= -9998.0:
-                    continue
-                wet_wse = WSE_Out_stream[r, c]
-                wet_depth = wet_wse - wet_cell_elev
-                if wet_depth <= MIN_FLOOD_DEPTH:
-                    continue
-
-                # Find the candidate dry cell that the wet cell should spill into.
-                for dr, dc in get_neighbor_offsets():
-                    nr = r + dr
-                    nc = c + dc
-
-                    if nr < 0 or nr >= nrows or nc < 0 or nc >= ncols:
-                        continue
-
-                    if (nr, nc) in main_channel_not_in_stream:
-                        continue
-
-                    # candidate cell's elevation
-                    dry_cell_elevation = E[nr, nc]
-
-                    # if we've hit the boundary of the DEM, ignore this cell
-                    if dry_cell_elevation <= -9998.0:
-                        continue
-
-                    # Preserve the wet-cell depth and reduce it only when the
-                    # spill candidate is at a higher elevation.
-                    candidate_depth = wet_depth
-                    delta_elevation = dry_cell_elevation - wet_cell_elev
-                    if delta_elevation > 0.0:
-                        candidate_depth = candidate_depth - delta_elevation
-                    if candidate_depth <= MIN_FLOOD_DEPTH:
-                        continue
-
-                    # if the cell is wet, ignore it
-                    if not np.isnan(WSE_Out_stream[nr, nc]) and WSE_Out_stream[nr, nc] >= dry_cell_elevation + candidate_depth:
-                        continue
-
-                    # Keep a sparse list of newly touched dry cells and retain
-                    # the max passing depth from all wet neighbors.
-                    if candidate_depth > exterior_boundary.get((nr, nc), np.float32(-np.inf)):
-                        exterior_boundary[(nr, nc)] = candidate_depth
-
-            exterior_boundary_list = [(row, col, depth, E[row, col]) for (row, col), depth in exterior_boundary.items()]
-
-            # Sort spillover locations by decreasing spillover depth (tie-breaker: highest elevation) to prioritize deeper spills and reduce iterations to steady-state.
-            exterior_boundary_list = sort_exterior_boundary(exterior_boundary_list)
-
-            # Process spillover candidates and backfill immediately for each new wet cell.
-            for r, c, source_depth, exterior_cell_elev in exterior_boundary_list:
-                source_wse = exterior_cell_elev + source_depth
-
-                # Write candidate spill only if it actually improves this cell.
-                if np.isnan(WSE_Out_stream[r, c]) or (source_wse > WSE_Out_stream[r, c] and source_wse > exterior_cell_elev):
-                    WSE_Out_stream[r, c] = source_wse
+            bdy = _boundary(records, filled_dem, nrows, ncols, bg)
+            if ssflg:
+                if len(records) > before and any(dtf < fldht for _, _, dtf in bdy):
+                    bdy = [row for row in bdy if row[2] < fldht]
+                    spill = len(bdy) > 0
                 else:
-                    continue
+                    spill = False
+            else:
+                spill = False
 
-                # This cell is now wet and can be a spill source in the next iteration, so add to the new interior boundary.
-                new_interior_boundary.add((r, c))
-                spill_changed = True
 
-                # Seed backfill stack with the current spill source.
-                queue = [(r, c)]
+    rows: list[list[float]] = []
+    for pixel, (fsp, dtf) in records.items():
+        out_dtf = max(fldmn, dtf)
+        # fill_adjusted = out_dtf + fil[pixel] - max(0.0, dem[pixel])
+        sink_fill_depth = filled_dem[pixel] - max(0.0, dem[pixel])
+        rows.append([fsp, pixel, out_dtf, sink_fill_depth])
 
-                # Flow downstream (using flowdir) until encountering a wet cell, stream location, or dead end.
-                rr = r
-                cc = c
-                # intial depth for spilloever
-                depth_use = source_depth
-                # initial elevation
-                previous_elev = exterior_cell_elev
-                while True:
-                    fd = flowdir[rr, cc]
-                    if fd <= 0:
-                        break
-                    dr, dc = get_dr_dc_from_flowdir(fd)
-                    rr = rr + dr
-                    cc = cc + dc
-                    if rr < 0 or rr >= nrows or cc < 0 or cc >= ncols:
-                        break
-
-                    # if we are at the edge of the DEM stop routing
-                    spilled_cell_elev = E[rr, cc]
-                    if spilled_cell_elev <= -9998.0:
-                        break
-                    
-                    if (rr, cc) in all_interior_cells and (source_wse - spilled_cell_elev) <= MIN_FLOOD_DEPTH:
-                        break
-
-                    # delta_elevation is almost like a rough head loss term
-                    delta_elevation = spilled_cell_elev - previous_elev
-                    if delta_elevation > 0.0:
-                        depth_use = depth_use - delta_elevation
-                    if depth_use <= MIN_FLOOD_DEPTH:
-                        break
-
-                    new_wse = spilled_cell_elev + depth_use
-
-                    # if the cell is dry or not deep enough, go ahead and flood it
-                    if np.isnan(WSE_Out_stream[rr, cc]) or WSE_Out_stream[rr, cc] < new_wse:
-                        WSE_Out_stream[rr, cc] = new_wse
-                        if (rr, cc) not in new_interior_boundary:
-                            new_interior_boundary.add((rr, cc))
-                            source_wse = new_wse
-                            previous_elev = spilled_cell_elev
-                    else:
-                        break
-
-                    queue.append((rr, cc))
-
-                    # Backfill upstream (reverse flowdir) immediately from newly flooded spillover cell.
-                    # Depth-first search (DFS) over reverse-flow neighbors.
-                    while queue:
-                        ur, uc = queue.pop()
-
-                        for dr, dc, dir_value in get_d8():
-                            nr = ur - dr
-                            nc = uc - dc
-
-                            # Is the new cell a cell which flows into this one?
-                            if 0 <= nr < nrows and 0 <= nc < ncols and flowdir[nr, nc] == dir_value:
-                                # Is the new cell inundated by this stream cell?
-                                if new_wse >= E[nr, nc] > -9998.0:
-                                    if np.isnan(WSE_Out_stream[nr, nc]) or new_wse > WSE_Out_stream[nr, nc]:
-                                        new_interior_boundary.add((nr, nc))
-                                        queue.append((nr, nc))
-                                        WSE_Out_stream[nr, nc] = new_wse
-                                        
-                    # if the cell is the main channel, stop routing here
-                    if (rr, cc) in main_channel_not_in_stream:
-                        break
-
-            # Update boundary queue from newly wet cells using local dry-neighbor
-            # count refreshes; only the 3x3 neighborhood around each new wet cell
-            # can change frontier status.
-            for r, c in new_interior_boundary:
-                for dr0, dc0 in get_neighbor_offsets():
-                    rr = r + dr0
-                    cc = c + dc0
-                    if rr < 1 or rr >= nrows - 1 or cc < 1 or cc >= ncols - 1:
-                        continue
-                    if np.isnan(WSE_Out_stream[rr, cc]) or WSE_Out_stream[rr, cc] <= E[rr, cc]:
-                        continue
-                    if (rr, cc) in all_interior_cells:
-                        continue
-
-                    for dr1, dc1 in get_neighbor_offsets():
-                        nr = rr + dr1
-                        nc = cc + dc1
-                        if np.isnan(WSE_Out_stream[nr, nc]) or WSE_Out_stream[nr, nc] <= E[nr, nc]:
-                            interior_boundary.append((rr, cc))
-                            all_interior_cells.add((rr, cc))
-                            break
-
-            # break
-
-            # Plot the new_interior_boundaryfor debugging
-            # import matplotlib.pyplot as plt
-            # boundary_r = [tup[0] for tup in new_interior_boundary]
-            # boundary_c = [tup[1] for tup in new_interior_boundary]
-            # min_r = np.min(boundary_r)
-            # max_r = np.max(boundary_r)
-            # min_c = np.min(boundary_c)
-            # max_c = np.max(boundary_c)
-            # plt.imshow(WSE_Out_stream, cmap='viridis')
-            # plt.scatter(boundary_c, boundary_r, color='red', label='New Interior Boundary')
-            # plt.colorbar(label='WSE_Out_stream')
-            # plt.title(f'Stream ID {stream_id} WSE_Out_stream with New Interior Boundary')
-            # plt.xlabel('Column Index')
-            # plt.ylabel('Row Index')
-            # plt.legend()
-            # # Filter plot to the bounding box of the new interior boundary plus a buffer
-            # plt.xlim(max(min_c - 10, 0), min(max_c + 10, ncols))
-            # plt.ylim(max(min_r - 10, 0), min(max_r + 10, nrows))
-            # plt.show()
-
-        # Here, let us plot WSEout stream for debugging
-        # import matplotlib.pyplot as plt
-        # plt.imshow(WSE_Out_stream, cmap='Blues')
-        # plt.colorbar(label='WSE_Out_stream')
-        # plt.title(f'Stream ID {stream_id} WSE_Out_stream')
-        # plt.xlabel('Column Index')
-        # plt.ylabel('Row Index')
-        # plt.show()
-
-        # Make a raster to and plot the main channel not in stream for debugging
-        # main_channel_raster = np.zeros((nrows, ncols), dtype=np.float32)
-        # for rr, cc in main_channel_not_in_stream:
-        #     main_channel_raster[rr, cc] = 1.0
-        # import matplotlib.pyplot as plt
-        # plt.imshow(main_channel_raster, cmap='Reds')
-        # plt.colorbar(label='Main Channel Not in Stream')
-        # plt.title(f'Stream ID {stream_id} Main Channel Not in Stream')
-        # plt.xlabel('Column Index')
-        # plt.ylabel('Row Index')
-        # plt.show()
-
-        # add the WSE_Out_stream to WSE_Out taking the maximum value when WSE_Out values are not NaNs.
-        for rr in prange(nrows):
-            for cc in range(ncols):
-                ws = WSE_Out_stream[rr, cc]
-                if np.isnan(ws) or ws <= -9998.0:
-                    continue
-                if np.isnan(WSE_Out[rr, cc]):
-                    WSE_Out[rr, cc] = ws
-                elif ws > WSE_Out[rr, cc]:
-                    WSE_Out[rr, cc] = ws
-
-    return WSE_Out
+    header = [
+        "FSP",
+        "FPP",
+        "DTF",
+        "sink fill depth",
+    ]
+    df = pd.DataFrame(rows, columns=header)
+    # df = df.sort_values(by=['FSP', 'FPP', 'DTF'])
+    return df
