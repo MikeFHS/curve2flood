@@ -20,14 +20,6 @@ NEIGHBOR_DELTAS = (
     (1, 1),
 )
 
-# Flow direction values in the MATLAB port's D8 convention.
-INFLOW = np.asarray([4, 8, 16, 2, 32, 1, 128, 64], dtype=np.int32)
-OUTFLOW = np.asarray([64, 128, 1, 32, 2, 16, 8, 4], dtype=np.int32)
-
-# MATLAB
-INFLOW = np.asarray([2, 4, 8, 1, 16, 128, 64, 32], dtype=np.int32)
-# OUTFLOW = np.asarray([32, 64, 128, 16, 1, 8, 4, 2], dtype=np.int32)
-
 # Whitebox D8
 # 64  128 1
 # 32  x   2
@@ -44,7 +36,7 @@ def _pixel_to_rc(pixel: int, ncols: int) -> tuple[int, int]:
 
 @njit(cache=True, nogil=True)
 def _rc_to_pixel(row: int, col: int, ncols: int) -> int:
-    return row * ncols + col
+    return np.int32(row * ncols + col)
 
 @njit(cache=True, nogil=True)
 def _valid_neighbors(pixel: int, nrows: int, ncols: int):
@@ -56,28 +48,41 @@ def _valid_neighbors(pixel: int, nrows: int, ncols: int):
             yield (pos, _rc_to_pixel(rr, cc, ncols))
 
 @njit(cache=True, nogil=True)
-def _next_downstream(pixel: int, fdr: np.ndarray, nrows: int, ncols: int) -> int | None:
+def _next_downstream(pixel: int, fdr: np.ndarray, nrows: int, ncols: int) -> int:
+    # ESRI D8
+    # OUTFLOW = {
+    #     np.uint8(32): (-1, -1),
+    #     np.uint8(64): (-1, 0),
+    #     np.uint8(128): (-1, 1),
+    #     np.uint8(16): (0, -1),
+    #     np.uint8(1): (0, 1),
+    #     np.uint8(8): (1, -1),
+    #     np.uint8(4): (1, 0),
+    #     np.uint8(2): (1, 1),
+    # }
+
+    # Whitebox D8
     OUTFLOW = {
-        np.uint8(32): (-1, -1),
-        np.uint8(64): (-1, 0),
-        np.uint8(128): (-1, 1),
-        np.uint8(16): (0, -1),
-        np.uint8(1): (0, 1),
-        np.uint8(8): (1, -1),
-        np.uint8(4): (1, 0),
-        np.uint8(2): (1, 1),
+        np.uint8(64): (-1, -1),
+        np.uint8(128): (-1, 0),
+        np.uint8(1): (-1, 1),
+        np.uint8(32): (0, -1),
+        np.uint8(2): (0, 1),
+        np.uint8(16): (1, -1),
+        np.uint8(8): (1, 0),
+        np.uint8(4): (1, 1),
     }
 
     fd = fdr[pixel]
     if fd == 0:
-        return None
+        return -1
 
     row, col = _pixel_to_rc(pixel, ncols)
     dr, dc = OUTFLOW[fd]
     rr = row + dr
     cc = col + dc
     if rr < 0 or rr >= nrows or cc < 0 or cc >= ncols:
-        return None
+        return -1
     return _rc_to_pixel(rr, cc, ncols)
 
 def _segment_pixels_matlab(seg_id: int, seg_info: np.ndarray, fdr: np.ndarray,
@@ -97,7 +102,7 @@ def _segment_pixels_matlab(seg_id: int, seg_info: np.ndarray, fdr: np.ndarray,
     current = start
     for _ in range(1, length):
         nxt = _next_downstream(current, fdr, nrows, ncols)
-        if nxt is None:
+        if nxt == -1:
             break
         pixels.append(nxt)
         current = nxt
@@ -115,54 +120,47 @@ def _downstream_exclusion_matlab(seg_id: int, seg_info: np.ndarray, fdr: np.ndar
     seen = {current}
     while True:
         nxt = _next_downstream(current, fdr, nrows, ncols)
-        if nxt is None or nxt in seen:
+        if nxt == -1 or nxt in seen:
             break
-        excluded.add(nxt)
-        seen.add(nxt)
+        excluded.add(np.int32(nxt))
+        seen.add(np.int32(nxt))
         current = nxt
 
+@njit(cache=True, nogil=True, parallel=True)
 def _segment_pixels(stream_id: int, stream_info: np.ndarray, fdr: np.ndarray, nrows: int, ncols: int) -> list[int]:
     """Return stream pixels for a segment id. The seed-point path is not ported."""
-    row = stream_info[stream_info[:, 3] == stream_id, [0, 2]]
-    start = row[0]
-    length = row[1]
-    # row = stream_info.iloc[1]
-    # if row.empty:
-    #     raise ValueError("stream_id not found in stream_info.")
+    mask = stream_info[:, 3] == stream_id
+    if not np.any(mask):
+        raise ValueError("stream_id not found in stream_info.")
+    
+    start = stream_info[mask, 0][0]
+    length = stream_info[mask, 2][0]
 
-    # start = round(row.iat[0, 0])
-    # length = round(row.iat[0, 2])
-    # length = round(row.iat[0, 4])
-    # start = round(row.iat[0])
-    # length = round(row.iat[4])
-
+    pixels = []
     if length <= 0:
-        return []
+        return pixels
 
-    pixels = [start]
+    pixels.append(start)
     current = start
     for _ in range(1, length):
         nxt = _next_downstream(current, fdr, nrows, ncols)
-        if nxt is None:
+        if nxt == -1:
             break
         pixels.append(nxt)
         current = nxt
     return pixels
 
-
+@njit(cache=True, nogil=True, parallel=True)
 def _downstream_exclusion(stream_id: int, stream_info: np.ndarray, fdr: np.ndarray, nrows: int, ncols: int) -> set[int]:
     """Pixels downstream of the segment end, excluded from spillover candidates."""
     end_pixel = stream_info[stream_info[:, 3] == stream_id, 1][0]  # Assuming linkno is in the 4th column (index 3)
-    # row = stream_info.iloc[1]
-    # end_pixel = int(row[0, 1])
-    # end_pixel = int(row.iat[1])
 
     excluded: set[int] = set()
     current = end_pixel
     seen = {current}
     while True:
         nxt = _next_downstream(current, fdr, nrows, ncols)
-        if nxt is None or nxt in seen:
+        if nxt == -1 or nxt in seen:
             break
         excluded.add(nxt)
         seen.add(nxt)
@@ -170,7 +168,7 @@ def _downstream_exclusion(stream_id: int, stream_info: np.ndarray, fdr: np.ndarr
 
     return excluded
 
-
+@njit(cache=True, nogil=True)
 def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
                           fil: np.ndarray, fdr: np.ndarray, nrows: int, ncols: int,
                           bg: float, flood_members: set[int] | None = None,
@@ -183,11 +181,18 @@ def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
     backfill pass in the MATLAB code. Spillover backfill passes leave it as None
     so existing pixels can be overwritten when the new DTF is lower.
     """
+    # Whitebox
+    INFLOW = np.array([4, 8, 16, 2, 32, 1, 128, 64], dtype=np.int32)
+
+    # MATLAB
+    # INFLOW = np.array([2, 4, 8, 1, 16, 128, 64, 32], dtype=np.int32)
+
     source_elev = fil[source]
     result: list[tuple[int, float]] = []
     queue: list[int] = [source]
     visited = {source}
-    excluded = excluded or set()
+    if excluded is None:
+        excluded = {np.int32(-1)} # This helps numba know what the set's type is
 
     while queue:
         center = queue.pop()
@@ -201,14 +206,50 @@ def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
             if fdr[nbr] != INFLOW[pos]:
                 continue
             dtf = base_dtf + max(0.0, fil[nbr] - source_elev)
-            visited.add(nbr)
+            visited.add(np.int32(nbr))
             result.append((nbr, dtf))
             queue.append(nbr)
 
     return result
 
-# @njit(cache=True, nogil=True)
-def _boundary(records: dict[int, tuple[int, float]], fil: np.ndarray,
+@njit(cache=True, nogil=True)
+def sort_boundary(lst: list, fil: np.ndarray) -> list:
+    # This is a numba-compatible sort, since numba cannot cache .sort(key=lambda x: (x[2], -fil[x[1]]
+    def key_func(x):
+        return x[2], -fil[x[1]]  # Sort by spillover, than elevation
+
+    for i in range(1, len(lst)):
+        current_item = lst[i]
+        current_key = key_func(current_item)
+        j = i - 1
+        
+        while j >= 0 and key_func(lst[j]) < current_key:
+            lst[j + 1] = lst[j]
+            j -= 1
+        lst[j + 1] = current_item
+        
+    return lst
+
+@njit(cache=True, nogil=True)
+def sort_candidates(lst: list) -> list:
+    # This is a numba-compatible sort, since numba cannot cache .sort(key=lambda x: (x[2], -x[4]))
+    def key_func(x):
+        return x[2], -x[4]  # Sort by spillover, than elevation
+
+    for i in range(1, len(lst)):
+        current_item = lst[i]
+        current_key = key_func(current_item)
+        j = i - 1
+        
+        while j >= 0 and key_func(lst[j]) < current_key:
+            lst[j + 1] = lst[j]
+            j -= 1
+        lst[j + 1] = current_item
+        
+    return lst
+
+@njit(cache=True, nogil=True)
+def _initial_boundary(records: dict[int, tuple[int, float]], fil: np.ndarray,
               nrows: int, ncols: int, bg: float) -> list[tuple[int, int, float]]:
     out: list[tuple[int, int, float]] = []
     for pixel, (fsp, dtf) in records.items():
@@ -218,17 +259,26 @@ def _boundary(records: dict[int, tuple[int, float]], fil: np.ndarray,
             if nbr not in records and fil[nbr] != bg:
                 out.append((fsp, pixel, dtf))
                 break
-    out.sort(key=lambda x: (x[2], -fil[x[1]]))
+    out = sort_boundary(out, fil)
     return out
 
+@njit(cache=True, nogil=True)
+def _update_boundary(records: dict[int, tuple[int, float]], filled_dem: np.ndarray, new_boundary: set[int]) -> list[tuple[int, int, float]]:
+    bdy = [
+        (records[p][0], p, records[p][1])
+        for p in new_boundary
+    ]
+    bdy = sort_boundary(bdy, filled_dem)
+    return bdy
 
+@njit(cache=True, nogil=True)
 def _flood_map(records: dict[int, tuple[int, float]], flddat: np.ndarray, fldmn: float) -> None:
     for pixel, (_, dtf) in records.items():
         flddat[pixel] = max(fldmn, dtf)
 
-
+@njit(cache=True, nogil=True)
 def _spill_candidates(boundary: list[tuple[int, int, float]], records: dict[int, tuple[int, float]],
-                      flddat: np.ndarray, fil: np.ndarray, nrows: int, ncols: int,
+                      fil: np.ndarray, nrows: int, ncols: int,
                       fldht: float, mxht: float, bg: float, excluded: set[int]) -> list[tuple[int, float, int, float, float]]:
     best: dict[int, tuple[float, float, int, float, float]] = {}
     for fsp, bdy_pixel, bdy_dtf in boundary:
@@ -244,11 +294,12 @@ def _spill_candidates(boundary: list[tuple[int, int, float]], records: dict[int,
                 continue
             spill_dtf = bdy_dtf + max(0.0, nbr_elev - bdy_elev)
             available_depth = fldht - bdy_dtf - max(0.0, nbr_elev - bdy_elev)
-            previous = best.get(nbr)
-            if previous is None:
+            if nbr not in best:
                 best[nbr] = (available_depth, bdy_elev, fsp, spill_dtf, nbr_elev)
             else:
-                old_available, old_bdy_elev, *_ = previous
+                previous = best[nbr]
+                old_available = previous[0]
+                old_bdy_elev = previous[1]
                 if available_depth > old_available or (
                     available_depth == old_available and bdy_elev > old_bdy_elev
                 ):
@@ -258,10 +309,10 @@ def _spill_candidates(boundary: list[tuple[int, int, float]], records: dict[int,
         (fsp, spill_dtf, pixel, pixel_elev, bdy_elev)
         for pixel, (_, bdy_elev, fsp, spill_dtf, pixel_elev) in best.items()
     ]
-    candidates.sort(key=lambda x: (x[1], -x[4]))
+    candidates = sort_candidates(candidates)
     return candidates
 
-
+@njit(cache=True, nogil=True)
 def _forward_path(start: int, spill_dtf: float, fil: np.ndarray, fdr: np.ndarray,
                   flddat: np.ndarray, nrows: int, ncols: int, bg: float,
                   excluded: set[int]) -> list[int]:
@@ -271,13 +322,13 @@ def _forward_path(start: int, spill_dtf: float, fil: np.ndarray, fdr: np.ndarray
     while True:
         if current in seen:
             break
-        seen.add(current)
-        path.append(current)
+        seen.add(np.int32(current))
+        path.append(np.int32(current))
         nxt = _next_downstream(current, fdr, nrows, ncols)
-        if nxt is None:
+        if nxt == -1:
             break
         if nxt in excluded:
-            path.append(nxt)
+            path.append(np.int32(nxt))
             break
         if fil[nxt] == bg:
             break
@@ -286,20 +337,21 @@ def _forward_path(start: int, spill_dtf: float, fil: np.ndarray, fdr: np.ndarray
         current = nxt
     return path
 
-
+@njit(cache=True, nogil=True)
 def _assimilate(records: dict[int, tuple[int, float]], fsp: int, pixel: int, dtf: float) -> bool:
-    old = records.get(pixel)
-    if old is None or old[1] > dtf:
+    if pixel not in records:
         records[pixel] = (fsp, dtf)
         return True
+    
+    if records[pixel][1] > dtf:
+        records[pixel] = (fsp, dtf)
+        return True
+    
     return False
 
-
-import tqdm
-
-# @njit(cache=True, nogil=True, parallel=True)
-@profile
-def fldpln_library_for_segment(dem: np.ndarray,
+@njit(cache=True, nogil=True, parallel=True)
+def _fldpln_library_for_segment(shape: tuple[int, int],
+                               dem: np.ndarray,
                                filled_dem: np.ndarray, 
                                flow_direction: np.ndarray, 
                                stream_id: int,
@@ -307,71 +359,35 @@ def fldpln_library_for_segment(dem: np.ndarray,
                                dh: float,
                                fldmn: float,
                                fldmx: float,
-                               ssflg: bool,
+                               iterative_spill: bool,
                                global_max_wse: float = 0.0,
-                               bg: float = -9999):
+                               bg: float = -9999) -> pd.DataFrame:
     """
-    This function is meant to mimic the FLDPLN model developed at the University of Kansas, translated iteratively
-    using Codex-ChatGPT and this repository: https://github.com/AlabamaWaterInstitute/fldpln and this documentation: 
-    https://services.kars.geoplatform.ku.edu/fldpln/AGU_2023_Operational_FIM_in_Kansas.pdf and 
-    https://kuscholarworks.ku.edu/server/api/core/bitstreams/df102f13-5968-4e45-ad04-91b4d8086de0/content
-
-    Propagate each seeded WSE upstream along reverse flow direction, then iteratively
-    perform boundary spillover and upstream backfill to steady-state.
-    A cell is inundated if its elevation + 0.1 m is lower than the seed WSE and it drains to
-    that seed cell. If multiple seeds reach a cell, keep the maximum WSE.
-
-    Inputs:
-    - WSE_Initial: seeded WSE raster (nan/-9998 where dry); WSE for each stream cell
-    - E: ground elevation raster
-    - flowdir: D8 flow direction grid
-    - streams: stream/segment ids for source labeling
-    - nrows/ncols: raster dimensions
-    
-    Notes:
-    - Spillover candidates are dry boundary cells adjacent to wet cells where WSE_Out > E.
-    - Candidate depth is selected from wet neighbors using a minimum required depth
-      (tie-breaker: highest boundary elevation).
-    - Spillover floods the candidate point and then backfills upstream (reverse flowdir)
-      to the spill depth until steady-state.
-
-    Returns WSE_Out or the WSE Array for a one set of streamflow inputs
+    Build an FLDPLN floodplain table for a stream segment.
     """
-    if dh <= 0:
-        raise ValueError("dh must be positive.")
-
-    nrows, ncols = dem.shape
-    if flow_direction.shape != (nrows, ncols):
-        raise ValueError("flow_direction shape must match filled_dem shape.")
-    if dem.shape != (nrows, ncols):
-        raise ValueError("dem shape must match filled_dem shape.")
-
-    dem = dem.astype(np.float32, copy=False).ravel()
-    filled_dem = filled_dem.astype(np.float32, copy=False).ravel()
-    flow_direction = flow_direction.astype(np.uint8, copy=False).ravel()
-
-    global_max_wse = np.finfo(np.float32).max if not global_max_wse else 0.99999 * global_max_wse
-    strpts = _segment_pixels(stream_id, stream_info, flow_direction, nrows, ncols)
+    nrows, ncols = shape
+    stream_pixels = _segment_pixels(stream_id, stream_info, flow_direction, nrows, ncols)
     excluded = _downstream_exclusion(stream_id, stream_info, flow_direction, nrows, ncols)
 
     records: dict[int, tuple[int, float]] = {}
-    for pixel in strpts:
+    for pixel in stream_pixels:
         if filled_dem[pixel] != bg:
             records[pixel] = (pixel, 0.0)
 
     fldht = 0.0
     iterations = int(np.ceil(fldmx / dh))
 
-    flddat = np.zeros(filled_dem.size, dtype=np.float32)
+    flood_depths = np.zeros(filled_dem.size, dtype=np.float32)
 
-    for _ in tqdm.tqdm(range(iterations), desc="Processing floodplain"):
+    for _ in range(iterations):
         fldht += min(dh, fldmx - fldht)
 
-        bdy = _boundary(records, filled_dem, nrows, ncols, bg)
-        _flood_map(records, flddat, fldmn)
+        boundary = _initial_boundary(records, filled_dem, nrows, ncols, bg)
+        new_boundary = set()
+        _flood_map(records, flood_depths, fldmn)
         flood_members = set(records)
 
-        for fsp, boundary_pixel, boundary_dtf in bdy:
+        for fsp, boundary_pixel, boundary_dtf in boundary:
             boundary_elev = filled_dem[boundary_pixel]
             max_wse = min(global_max_wse, boundary_elev + fldht - boundary_dtf)
             additions = _backfill_from_source(
@@ -380,20 +396,23 @@ def fldpln_library_for_segment(dem: np.ndarray,
             )
             for pixel, dtf in additions:
                 if _assimilate(records, fsp, pixel, dtf):
-                    flddat[pixel] = max(fldmn, dtf)
-                    flood_members.add(pixel)
+                    flood_depths[pixel] = max(fldmn, dtf)
+                    flood_members.add(np.int32(pixel))
+                    new_boundary.add(np.int32(pixel))
 
-        bdy = _boundary(records, filled_dem, nrows, ncols, bg)
+        boundary = _update_boundary(records, filled_dem, new_boundary)
         spill = True
         while spill:
             before = len(records)
-            _flood_map(records, flddat, fldmn)
+            _flood_map(records, flood_depths, fldmn)
             candidates = _spill_candidates(
-                bdy, records, flddat, filled_dem, nrows, ncols, fldht, global_max_wse, bg, excluded
+                boundary, records, filled_dem, nrows, ncols, fldht, global_max_wse, bg, excluded
             )
 
+            new_boundary.clear()
+
             for fsp, spill_dtf, pixel, pixel_elev, _ in candidates:
-                path = _forward_path(pixel, spill_dtf, filled_dem, flow_direction, flddat, nrows, ncols, bg, excluded)
+                path = _forward_path(pixel, spill_dtf, filled_dem, flow_direction, flood_depths, nrows, ncols, bg, excluded)
                 if not path:
                     continue
                 path_set = set(path)
@@ -411,26 +430,94 @@ def fldpln_library_for_segment(dem: np.ndarray,
                     )
 
                 for new_pixel, local_dtf in pending:
-                    _assimilate(records, fsp, new_pixel, local_dtf + spill_dtf)
+                    if _assimilate(records, fsp, new_pixel, local_dtf + spill_dtf):
+                        new_boundary.add(np.int32(new_pixel))
 
-            bdy = _boundary(records, filled_dem, nrows, ncols, bg)
-            if ssflg:
-                if len(records) > before and any(dtf < fldht for _, _, dtf in bdy):
-                    bdy = [row for row in bdy if row[2] < fldht]
-                    spill = len(bdy) > 0
+            boundary = _update_boundary(records, filled_dem, new_boundary)
+            if iterative_spill:
+                has_shallow_boundary = False
+
+                for _, _, dtf in boundary:
+                    if dtf < fldht:
+                        has_shallow_boundary = True
+                        break
+
+                if len(records) > before and has_shallow_boundary:
+                    spill = len([row for row in boundary if row[2] < fldht]) > 0
                 else:
                     spill = False
             else:
                 spill = False
 
-
     rows: list[list[float]] = []
     for pixel, (fsp, dtf) in records.items():
         out_dtf = max(fldmn, dtf)
-        # fill_adjusted = out_dtf + fil[pixel] - max(0.0, dem[pixel])
         sink_fill_depth = filled_dem[pixel] - max(0.0, dem[pixel])
         rows.append([fsp, pixel, out_dtf, sink_fill_depth])
 
+    return rows
+
+def fldpln_library_for_segment(dem: np.ndarray,
+                               filled_dem: np.ndarray, 
+                               flow_direction: np.ndarray, 
+                               stream_id: int,
+                               stream_info: np.ndarray,
+                               dh: float,
+                               fldmn: float,
+                               fldmx: float,
+                               iterative_spill: bool,
+                               global_max_wse: float = 0.0,
+                               bg: float = -9999):
+    """Build an FLDPLN floodplain table for a single stream segment.
+
+    Parameters
+    ----------
+    dem : np.ndarray
+        Original elevation raster.
+    filled_dem : np.ndarray
+        Filled elevation raster.
+    flow_direction : np.ndarray
+        D8 flow-direction raster, assumes whitebox conventions.
+    stream_id : int
+        Stream segment identifier.
+    stream_info : np.ndarray
+        Segment metadata, as a 2D array with one row per segment and columns including start pixel (0), end pixel (1), length (2), and linkno (3).
+    dh : float
+        Flood increment step; must be positive.
+    fldmn : float
+        Minimum flood depth.
+    fldmx : float
+        Maximum flood depth to evaluate.
+    iterative_spill : bool
+        If True, continue spilling while shallow boundary conditions exist.
+    global_max_wse : float, optional
+        Upper bound on water-surface elevation. 0 means no bound. 
+    bg : float, optional
+        Background/no-data value in DEM.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Table with FSP, FPP, DTF, and sink fill depth columns.
+    """
+    if dh <= 0:
+        raise ValueError("dh must be positive.")
+
+    nrows, ncols = dem.shape
+    if flow_direction.shape != (nrows, ncols):
+        raise ValueError("flow_direction shape must match filled_dem shape.")
+    if dem.shape != (nrows, ncols):
+        raise ValueError("dem shape must match filled_dem shape.")
+
+    dem = dem.astype(np.float32, copy=False).ravel()
+    filled_dem = filled_dem.astype(np.float32, copy=False).ravel()
+    flow_direction = flow_direction.astype(np.uint8, copy=False).ravel()
+
+    global_max_wse = np.finfo(np.float32).max if not global_max_wse else 0.99999 * global_max_wse
+
+    rows = _fldpln_library_for_segment(
+        (np.int32(nrows), np.int32(ncols)), dem, filled_dem, flow_direction, stream_id, stream_info, dh, fldmn, fldmx, iterative_spill, global_max_wse, bg
+    )
     header = [
         "FSP",
         "FPP",
@@ -438,5 +525,4 @@ def fldpln_library_for_segment(dem: np.ndarray,
         "sink fill depth",
     ]
     df = pd.DataFrame(rows, columns=header)
-    # df = df.sort_values(by=['FSP', 'FPP', 'DTF'])
     return df
