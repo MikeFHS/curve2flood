@@ -1,9 +1,13 @@
 from __future__ import annotations
+from pathlib import Path
+from multiprocessing import shared_memory
 
-
+import tqdm
 import numpy as np
 import pandas as pd
-from numba import njit, prange
+from numba import njit
+from osgeo import gdal
+import multiprocessing as mp
 
 # Neighbor order used in the MATLAB code:
 # 1 2 3
@@ -41,11 +45,13 @@ def _rc_to_pixel(row: int, col: int, ncols: int) -> int:
 @njit(cache=True, nogil=True)
 def _valid_neighbors(pixel: int, nrows: int, ncols: int):
     row, col = _pixel_to_rc(pixel, ncols)
+    out = []
     for pos, (dr, dc) in enumerate(NEIGHBOR_DELTAS):
         rr = row + dr
         cc = col + dc
         if 0 <= rr < nrows and 0 <= cc < ncols:
-            yield (pos, _rc_to_pixel(rr, cc, ncols))
+            out.append((pos, _rc_to_pixel(rr, cc, ncols)))
+    return out
 
 @njit(cache=True, nogil=True)
 def _next_downstream(pixel: int, fdr: np.ndarray, nrows: int, ncols: int) -> int:
@@ -525,4 +531,223 @@ def fldpln_library_for_segment(dem: np.ndarray,
         "sink fill depth",
     ]
     df = pd.DataFrame(rows, columns=header)
+    df["FSP"] = df["FSP"].astype(np.int32)
+    df["FPP"] = df["FPP"].astype(np.int32)
     return df
+
+
+def _set_shared(name: str, shm: shared_memory.SharedMemory):
+    """
+    We need the shared memory objects to persist somewhere; otherwise, the memory is freed and the numpy arrays point to invalid memory.
+    These must last the lifetime of the program! Reason being, bathymetry is the last thing written, and we need the shared memory to persist until then.
+    """
+    global _SHARED_MEMORYS
+    _SHARED_MEMORYS[name] = shm
+
+def read_array_and_set_shared(file: str, dtype: np.dtype, set_shared: bool,
+                              name: str = None):
+    ds = gdal.Open(file)
+    shape = (ds.RasterYSize, ds.RasterXSize)
+
+    dtype = np.dtype(dtype)
+    if not set_shared:
+        arr = np.empty(
+            shape, 
+            dtype=dtype
+        )
+        arr[:] = ds.ReadAsArray()
+        return arr
+    
+    size = int(dtype.itemsize * np.prod(shape))
+    shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+    arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+    arr[:] = ds.ReadAsArray()
+    globals()[name] = arr
+    _set_shared(name, shm)
+    return arr
+
+def run_parallel(args):
+    return fldpln_library_for_segment(
+            globals()['dem_array'],
+            globals()['filled_dem_array'],
+            globals()['flow_direction_array'],
+            *args
+        )
+
+def close_shared_memory(names: list[str]):
+    """
+    Close and unlink shared memory segments.
+
+    Parameters
+    ----------
+    names : list[str]
+        Names of the shared memory segments to close.
+    """
+    for name in names:
+        shm = globals().get(name)
+        if shm is not None:
+            shm.close()
+            shm.unlink()
+            del globals()[name]
+            del _SHARED_MEMORYS[name]
+
+def init_parallel(
+    names: list[str],
+    shapes: list[tuple],
+    dtypes: list[np.dtype],
+):
+    """
+    Worker initializer for multiprocessing.
+
+    Attaches shared memory segments into NumPy arrays and stores them into
+    module-level globals so the per-cell worker function can run without
+    pickling large arrays.
+
+    Parameters
+    ----------
+    names, shapes, dtypes
+        Metadata produced by :func:`get_init_parallel_args`.
+    """
+    shms = [shared_memory.SharedMemory(name=name) for name in names]
+
+    for shm, name, shape, dtype in zip(shms, names, shapes, dtypes):
+        _set_shared(name, shm)
+        globals()[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+
+def build_fldpln_library(
+    dem: str,
+    filled_dem: str,
+    stream_info_file: str,
+    flow_direction_file: str,
+    library_file: str,
+    dh: float,
+    fldmn: float,
+    fldmx: float,
+    iterative_spill: bool,
+    vdt_file: str = None,
+    stream_ids: list[int] | None = None,
+    global_max_wse: float = 0.0,
+    bg: float = -9999,
+    parallel: bool = False,
+    pbar: bool = True,
+    processes: int | None = None
+):
+    """
+    Build floodplain library.
+
+    Parameters
+    ----------
+    dem: str
+        Path to the DEM raster.
+    filled_dem: str
+        Path to the filled DEM raster.
+    stream_info_file: str
+        Path to the stream info CSV file.
+    flow_direction_file: str
+        Path to the flow direction raster.
+    dh: float
+        Depth increment (meters).
+    fldmn: float
+        Minimum depth for a cell to be considered flooded (meters).
+    fldmx: float
+        Maximum floodplain depth to iterate up to (meters).
+    iterative_spill: bool
+        Whether to use iterative spill routing when generating outputs. Recommended if the DEM is high resolution (<= 10 m)
+    vdt_file: str | None
+        Optional VDT file used to derive per-stream maximum depths.
+    stream_ids: list[int] | None
+        Optional subset of COMIDs to process.
+    global_max_wse: float
+        Global maximum water-surface elevation override.
+    bg: float
+        Background/no-data value for output rasters.
+    parallel: bool
+        If True, process stream reaches using multiprocessing.
+    pbar
+        If True, display a progress bar.
+    processes
+        Number of worker processes to use when parallel is enabled.
+    """
+    stream_info = pd.read_csv(stream_info_file)
+    assert stream_info.ndim == 2, "Stream info file must be a 2D table"
+    assert stream_info.shape[1] == 4, "Stream info file must have 4 columns: start pixel (0), end pixel (1), length (2), and stream ID (3)"
+
+    if stream_ids is not None:
+        stream_info = stream_info[stream_info.iloc[:, 3].isin(stream_ids)]
+
+    dem_array = read_array_and_set_shared(dem, np.float32, set_shared=parallel, name='dem_array')
+    filled_dem_array = read_array_and_set_shared(filled_dem, np.float32, set_shared=parallel, name='filled_dem_array')
+    flow_direction_array = read_array_and_set_shared(flow_direction_file, np.uint8, set_shared=parallel, name='flow_direction_array')
+
+    stream_ids = stream_info.iloc[:, 3].unique()
+    if vdt_file is None:
+        max_depths = [fldmx] * len(stream_ids)
+    else:
+        if Path(vdt_file).suffix in {'parquet', 'pq'}:
+            vdt_df = pd.read_parquet(vdt_file)
+        else:
+            vdt_df = pd.read_csv(vdt_file)
+
+        vdt_df = vdt_df[vdt_df['COMID'].isin(stream_ids)]
+        # Find last wse_* column
+        wse_cols = [col for col in vdt_df.columns if col.startswith('wse_')]
+        assert wse_cols, "No wse_* columns found in VDT file"
+        max_wse_col = wse_cols[-1]
+        vdt_df['depth'] = vdt_df[max_wse_col] - dem_array[vdt_df['Row'], vdt_df['Col']]
+        ids_max_depths = vdt_df.groupby('COMID', sort=False, as_index=False)['depth'].max().values
+        stream_ids = ids_max_depths[:, 0].astype(np.int32)
+        max_depths = np.minimum(ids_max_depths[:, 1], fldmx)
+
+    if pbar:
+        pbar = tqdm.tqdm
+    else:
+        pbar = lambda x, **kwargs: x
+
+    if processes is None:
+        processes = max(min(mp.cpu_count(), len(stream_ids)), 1)
+        if processes == 1:
+            parallel = False
+
+    args = [
+        (
+            stream_id,
+            stream_info.values,
+            dh,
+            fldmn,
+            max_depths[i],
+            iterative_spill,
+            global_max_wse, 
+            bg
+        )
+        for i, stream_id in enumerate(stream_ids)
+    ]
+    # Sort args from largest max depth to smallest, (longest time to shortest)
+    args.sort(key=lambda x: x[4], reverse=True)
+
+    dfs: list[pd.DataFrame] = []
+    if parallel:
+        names = ['dem_array', 'filled_dem_array', 'flow_direction_array']
+        shapes = [dem_array.shape, filled_dem_array.shape, flow_direction_array.shape]
+        dtypes = [dem_array.dtype, filled_dem_array.dtype, flow_direction_array.dtype]
+        with mp.Pool(processes, init_parallel, (names, shapes, dtypes)) as pool:
+            for df in pbar(pool.imap_unordered(run_parallel, args), total=len(args), desc="Processing streams in parallel"):
+                dfs.append(df)
+    else:
+        for i, _ in enumerate(pbar(stream_ids, desc="Processing streams")):
+            dfs.append(fldpln_library_for_segment(
+                dem_array,
+                filled_dem_array,
+                flow_direction_array,
+                *args[i]
+            ))
+
+    close_shared_memory(['dem_array', 'filled_dem_array', 'flow_direction_array'])
+
+    df = pd.concat(dfs, ignore_index=True)
+    dfs = None
+    df = df.sort_values(['FSP', 'FPP'], ignore_index=True)
+    df = df.round(3)
+    if Path(library_file).suffix in {'parquet', 'pq'}:
+        df.to_parquet(library_file, compression='brotli', index=False, store_decimal_as_integer=True)
+    else:
+        df.to_csv(library_file, index=False)
