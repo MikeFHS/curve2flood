@@ -51,7 +51,6 @@ def create_kernel_weighted_spread_map(
     B,
     nrows,
     ncols,
-    sd,
     TW_m,
     dx,
     dy,
@@ -116,16 +115,6 @@ def create_kernel_weighted_spread_map(
 
         #This is how many cells we will be looking at surrounding our stream cell
         COMID_TW = int(max(np.round(COMID_TW_m / dx), np.round(COMID_TW_m / dy)))
-
-        
-        # Find minimum elevation within the search box
-        if sd >= 1:
-            for rr in range(max(r - sd, 0), min(r + sd + 1, nrows - 1)):
-                for cc in range(max(c - sd, 1), min(c + sd + 1, ncols - 1)):
-                    if E[rr,cc] > 0.1 and E[rr,cc] < E_Min:
-                        E_Min = E[rr,cc]
-                        r_use = rr
-                        c_use = cc
 
         r_min = max(r_use - COMID_TW, 1)
         r_max = min(r_use + COMID_TW + 1, nrows + 1)
