@@ -16,8 +16,6 @@ setup(
         "numpy",
         "pandas",
         "gdal",
-        "fastparquet",
-        "rasterio",
         "geopandas",
         "pyyaml",
         "shapely",
@@ -38,4 +36,7 @@ setup(
     ],
     python_requires=">=3.10",
     license="GPL-3.0",
+    extras_require={
+        "all": ["intel-cmplr-lib-rt"] # Speeds up numba
+    }
 )
