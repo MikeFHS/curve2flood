@@ -17,7 +17,7 @@ from numba import njit, prange
 from osgeo import gdal, osr, ogr
 
 from shapely.geometry import shape
-from scipy.ndimage import label, generate_binary_structure, distance_transform_edt
+from scipy.ndimage import label, generate_binary_structure, distance_transform_edt, uniform_filter, convolve
 
 from curve2flood import LOG
 from curve2flood.spreaders import (
@@ -27,23 +27,6 @@ from curve2flood.spreaders import (
 gdal.UseExceptions()
 
 COMID_FLOW_DICT_TYPE = dict[np.int32, np.float32]
-
-def _parse_optional_bool(value, default: bool = False) -> bool:
-    if value in (None, ""):
-        return default
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in ("true", "1", "yes", "y")
-
-def _parse_optional_float(value, default: float | None = None) -> float | None:
-    if value in (None, ""):
-        return default
-    return float(value)
-
-def _parse_optional_int(value, default: int | None = None) -> int | None:
-    if value in (None, ""):
-        return default
-    return int(value)
 
 def read_manning_table(s_manning_path: str, da_input_mannings: np.ndarray):
     """
@@ -731,83 +714,6 @@ def CreateSimpleKernelFloodMap(params: dict, RR, CC, T_Rast, W_Rast, S_Rast, E, 
     
     return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], None
 
-
-
-@njit("float32[:](float32)", cache=True, parallel=True)
-def create_gaussian_kernel_1d(sigma):
-    kernel_size = int(6 * sigma + 1)
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    center = kernel_size // 2
-
-    kernel = np.empty(kernel_size, dtype=np.float32)
-
-    for i in prange(kernel_size):
-        x = i - center
-        kernel[i] = np.exp(- (x**2) / (2.0 * sigma**2))
-
-    sum_val = np.sum(kernel)
-    kernel /= sum_val
-
-    return kernel
-
-@njit("float32[:, :](float32[:, :], float32[:])", cache=True)
-def convolve_rows(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    nrows, ncols = image.shape
-    klen = len(kernel)
-    pad = klen // 2
-    output = np.empty_like(image)
-
-    for r in range(nrows):
-        for c in range(ncols):
-            acc = 0.0
-            weight_sum = 0.0
-            c_start = max(0, c - pad)
-            c_end = min(ncols, c + pad + 1)
-            k_start = pad - (c - c_start)
-
-            for k in range(c_end - c_start):
-                val = image[r, c_start + k]
-                if val <= -9998.0:
-                    w = kernel[k_start + k]
-                    acc += val * w
-                    weight_sum += w
-
-            output[r, c] = acc / weight_sum if weight_sum > 0 else image[r, c]
-    return output
-
-@njit("float32[:, :](float32[:, :], float32[:])", cache=True, parallel=True)
-def convolve_cols(image, kernel):
-    nrows, ncols = image.shape
-    klen = len(kernel)
-    pad = klen // 2
-    output = np.zeros_like(image)
-
-    for c in prange(ncols):
-        for r in range(nrows):
-            acc = 0.0
-            weight_sum = 0.0
-            r_start = max(0, r - pad)
-            r_end = min(nrows, r + pad + 1)
-            k_start = pad - (r - r_start)
-
-            for k in range(r_end - r_start):
-                val = image[r_start + k, c]
-                if val != -9999.0:
-                    acc += val * kernel[k_start + k]
-                    weight_sum += kernel[k_start + k]
-
-            output[r, c] = acc / weight_sum if weight_sum > 0 else image[r, c]
-    return output
-
-@njit("float32[:, :](float32[:, :], float32)", cache=True)
-def gaussian_blur_separable(image, sigma):
-    kernel = create_gaussian_kernel_1d(sigma)
-    blurred = convolve_rows(image, kernel)
-    blurred = convolve_cols(blurred, kernel)
-    return blurred
-
-
 @njit(cache=True, parallel=True)
 def spread_Bathy(
     nrows: int,
@@ -876,44 +782,40 @@ def Create_Topobathy_Dataset(
 
     E, Bathy, ARBathyMask are all (nrows+2, ncols+2).
     """
-    # ------------------------------------------------------------
-    # 1) PRE-CLEANUP: Outside ARBathyMask, Bathy = DEM BEFORE weighting
-    # ------------------------------------------------------------
-    mask = (Bathy < -98.99) & (ARBathyMask == 1)
-    Bathy[mask] = E[mask]
-
-    # 2) Identify valid bathy donors inside the water mask
-    #    (same nodata threshold as before: > -98.99)
+    # 1) Spread Bathy values using the WeightBox kernel, accumulating weighted sums and total weights
     bathy_times_weight, total_weight = spread_Bathy(nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, Bathy, ARBathyMask)
 
-    # 5) Start from original Bathy, and fill only where Bathy was invalid
+    # 2) Start from original Bathy, and fill only where Bathy was invalid
     filled = Bathy.copy()
 
     invalid = (Bathy <= -98.99) | np.isnan(Bathy)
 
     use_weight = invalid & (total_weight > 1e-10)
-    use_dem    = invalid & ~use_weight
+    use_dem    = ~use_weight
 
     filled[use_weight] = bathy_times_weight[use_weight] / total_weight[use_weight]
     filled[use_dem] = E[use_dem]
 
-    # 6) Optional extra smoothing (you can keep or weaken this)
-    sigma_value = 1.0
-    filled = gaussian_blur_separable(filled, sigma=sigma_value)
+    # 3) Optional extra smoothing (you can keep or weaken this)
+    # We smooth using a fun math trick, only within the AR bathy mask, to avoid smoothing the banks in!.
+    weighted = np.where(ARBathyMask, filled, 0)
+    value_sum = uniform_filter(weighted, size=5) * 5
+    count = uniform_filter(ARBathyMask.astype(np.float32), size=5) * 5
+    np.divide(value_sum, count, out=filled, where=count > 0)
 
-    # 7) Outside the AR bathy mask, always use DEM
+    # 4) Outside the AR bathy mask, always use DEM
     mask = ARBathyMask != 1
     filled[mask] = E[mask]
 
-    # 8) Final safety net: any remaining bad values from DEM
+    # 5) Final safety net: any remaining bad values from DEM
     mask = (filled <= -98.99) | (filled < -9998.0) | np.isnan(filled)
     filled[mask] = E[mask]
     
-    # 9) Honor Bathy_Use_Banks: keep bathy from being above DEM if requested
+    # 6) Honor Bathy_Use_Banks: keep bathy from being above DEM if requested
     if not Bathy_Use_Banks:
         np.minimum(filled, E, out=filled)
 
-    # 10) Return interior (arrays are padded by 1)
+    # 7) Return interior (arrays are padded by 1)
     return filled[1:nrows+1, 1:ncols+1]
 
 def Calculate_Depth_TopWidth_TWMax_Velocity(params: dict, E, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, dx, dy, quiet):    # Initialize all dictionaries

@@ -2,15 +2,115 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from affine import Affine
+from osgeo import gdal, osr, ogr, gdal_array
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
 from shapely.geometry import Point
-from rasterio.features import rasterize
 
 from curve2flood._log import LOG
 
 ID_SYNONYMS = ["COMID", "RIVID", "river_id", "LINKNO"]
+GeoTransform = tuple[float, float, float, float, float, float]
+
+def _normalize_geotransform(transform) -> GeoTransform:
+    """
+    Return a GDAL geotransform tuple.
+
+    Accepts native GDAL tuples and Affine-like objects that expose `to_gdal()`.
+    """
+    if hasattr(transform, "to_gdal"):
+        values = tuple(float(v) for v in transform.to_gdal())
+    else:
+        values = tuple(float(v) for v in transform)
+    if len(values) != 6:
+        raise ValueError(f"Expected a 6-element geotransform, received {len(values)} values.")
+    return values
+
+def _numpy_dtype_from_output_type(output_type) -> np.dtype:
+    if isinstance(output_type, int):
+        np_type = gdal_array.GDALTypeCodeToNumericTypeCode(output_type)
+        if np_type is None:
+            raise TypeError(f"Unsupported GDAL output type: {output_type}")
+        return np.dtype(np_type)
+    return np.dtype(output_type)
+
+def _gdal_dtype_from_output_type(output_type) -> int:
+    if isinstance(output_type, int):
+        return int(output_type)
+    np_dtype = np.dtype(output_type)
+    if np_dtype == np.dtype(bool):
+        return int(gdal.GDT_Byte)
+    gdal_type = gdal_array.NumericTypeCodeToGDALTypeCode(np_dtype)
+    if gdal_type is None:
+        raise TypeError(f"Unsupported NumPy output type: {output_type}")
+    return int(gdal_type)
+
+def rasterize_shapes_gdal(
+    shapes,
+    out_shape: tuple[int, int],
+    transform,
+    fill=0,
+    dtype=np.uint8,
+    all_touched: bool = False,
+    projection_wkt: str | None = None,
+) -> np.ndarray:
+    """
+    Rasterize shapely geometries to a NumPy array using GDAL.
+    """
+    geotransform = _normalize_geotransform(transform)
+    np_dtype = _numpy_dtype_from_output_type(dtype)
+    gdal_dtype = _gdal_dtype_from_output_type(dtype)
+
+    raster_driver = gdal.GetDriverByName("MEM")
+    raster_ds = raster_driver.Create("", xsize=int(out_shape[1]), ysize=int(out_shape[0]), bands=1, eType=gdal_dtype)
+    raster_ds.SetGeoTransform(geotransform)
+    if projection_wkt:
+        raster_ds.SetProjection(str(projection_wkt))
+
+    band = raster_ds.GetRasterBand(1)
+    band.WriteArray(np.full(out_shape, fill, dtype=np_dtype))
+
+    vector_driver = ogr.GetDriverByName("MEM") or ogr.GetDriverByName("Memory")
+    vector_ds = vector_driver.CreateDataSource("")
+    layer_srs = None
+    if projection_wkt:
+        layer_srs = osr.SpatialReference()
+        layer_srs.ImportFromWkt(str(projection_wkt))
+    layer = vector_ds.CreateLayer("shapes", srs=layer_srs, geom_type=ogr.wkbUnknown)
+
+    field_name = "burn"
+    layer.CreateField(ogr.FieldDefn(field_name, ogr.OFTReal))
+    layer_defn = layer.GetLayerDefn()
+
+    feature_count = 0
+    for geom, value in shapes:
+        if geom is None or value is None:
+            continue
+        if hasattr(geom, "is_empty") and geom.is_empty:
+            continue
+        if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+            continue
+        shapely_geom = geom if hasattr(geom, "wkb") else shape(geom)
+        ogr_geom = ogr.CreateGeometryFromWkb(shapely_geom.wkb)
+        feature = ogr.Feature(layer_defn)
+        feature.SetField(field_name, float(value))
+        feature.SetGeometry(ogr_geom)
+        layer.CreateFeature(feature)
+        feature = None
+        feature_count += 1
+
+    if feature_count > 0:
+        options = [f"ATTRIBUTE={field_name}"]
+        if all_touched:
+            options.append("ALL_TOUCHED=TRUE")
+        err = gdal.RasterizeLayer(raster_ds, [1], layer, options=options)
+        if err != 0:
+            raise RuntimeError(f"GDAL rasterization failed with error code {err}.")
+
+    array = band.ReadAsArray()
+    vector_ds = None
+    raster_ds = None
+    return np.asarray(array)
 
 def find_id_column(columns, context: str) -> str:
     """Find a stream identifier column using the FHS synonym set."""
@@ -726,7 +826,7 @@ def _grid_xy_from_rc(rows: np.ndarray, cols: np.ndarray, dx: float, dy: float) -
     local projected grid measured in meters.
 
     The x axis increases to the right. The y axis is negative downward so the
-    generated Affine transform matches raster row indexing.
+    generated geotransform matches raster row indexing.
     """
     x = (cols.astype(np.float32) + np.float32(0.5)) * np.float32(dx)
     y = -((rows.astype(np.float32) + np.float32(0.5)) * np.float32(dy))
@@ -931,7 +1031,7 @@ def build_variable_buffer_masks_from_points(
     y: np.ndarray,
     topwidth: np.ndarray,
     dem_shape: tuple[int, int],
-    transform: Affine,
+    transform: GeoTransform,
     fixed_corridor_buffer_m: float,
     fixed_anchor_buffer_m: float,
     use_topwidth_buffers: bool = True,
@@ -965,8 +1065,20 @@ def build_variable_buffer_masks_from_points(
         corridor_shapes = ((geom.buffer(float(fixed_corridor_buffer_m)), 1) for geom in points)
         anchor_shapes = ((geom.buffer(float(fixed_anchor_buffer_m)), 1) for geom in points)
 
-    corridor = rasterize(corridor_shapes, out_shape=dem_shape, transform=transform, all_touched=False).astype(bool)
-    anchor = rasterize(anchor_shapes, out_shape=dem_shape, transform=transform, all_touched=False).astype(bool)
+    corridor = rasterize_shapes_gdal(
+        corridor_shapes,
+        out_shape=dem_shape,
+        transform=transform,
+        dtype=np.uint8,
+        all_touched=False,
+    ).astype(bool)
+    anchor = rasterize_shapes_gdal(
+        anchor_shapes,
+        out_shape=dem_shape,
+        transform=transform,
+        dtype=np.uint8,
+        all_touched=False,
+    ).astype(bool)
     return corridor, anchor
 
 def build_target_coordinates(xs: np.ndarray, ys: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -1319,7 +1431,7 @@ def create_fhs_flood_map_from_points(
         use_topwidth_max_distance = False
 
     nrows, ncols = dem.shape
-    transform = Affine(float(dx), 0.0, 0.0, 0.0, -float(dy), 0.0)
+    transform = (0.0, float(dx), 0.0, 0.0, 0.0, -float(dy))
     xs = (np.arange(ncols, dtype=np.float32) + np.float32(0.5)) * np.float32(dx)
     ys = -((np.arange(nrows, dtype=np.float32) + np.float32(0.5)) * np.float32(dy))
 
@@ -1381,7 +1493,7 @@ def create_fhs_flood_map_from_points(
         if point_ids is not None and use_topwidth_max_distance:
             tmp_df = pd.DataFrame({"id_col": point_ids[valid], "tw_based_dist": maxdist_topwidth_factor * tw_valid})
             grouped = tmp_df.groupby("id_col")["tw_based_dist"].median()
-            point_max_distance = tmp_df["id_col"].map(grouped).to_numpy(dtype=np.float32)
+            point_max_distance = tmp_df["id_col"].map(grouped).to_numpy(dtype=np.float32, copy=True)
             bad = ~np.isfinite(point_max_distance)
             point_max_distance[bad] = max_distance_m
         else:

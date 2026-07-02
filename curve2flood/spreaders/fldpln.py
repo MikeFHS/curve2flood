@@ -537,6 +537,8 @@ def fldpln_library_for_segment(dem: np.ndarray,
     df = pd.DataFrame(rows, columns=header)
     df["FSP"] = df["FSP"].astype(np.int32)
     df["FPP"] = df["FPP"].astype(np.int32)
+    df['DTF'] = df['DTF'].astype(np.float32)
+    df['fill depth'] = df['fill depth'].astype(np.float32)
     return df
 
 
@@ -588,7 +590,7 @@ def close_shared_memory(names: list[str]):
         Names of the shared memory segments to close.
     """
     for name in names:
-        shm = globals().get(name)
+        shm = _SHARED_MEMORYS.get(name)
         if shm is not None:
             shm.close()
             shm.unlink()
@@ -679,15 +681,15 @@ def build_fldpln_library(
     if stream_ids is not None:
         stream_info = stream_info[stream_info.iloc[:, 3].isin(stream_ids)]
 
-    dem_array = read_array_and_set_shared(dem, np.float32, set_shared=parallel, name='dem_array')
-    filled_dem_array = read_array_and_set_shared(filled_dem, np.float32, set_shared=parallel, name='filled_dem_array')
+    dem_array = read_array_and_set_shared(dem, np.float16, set_shared=parallel, name='dem_array')
+    filled_dem_array = read_array_and_set_shared(filled_dem, np.float16, set_shared=parallel, name='filled_dem_array')
     flow_direction_array = read_array_and_set_shared(flow_direction_file, np.uint8, set_shared=parallel, name='flow_direction_array')
 
     stream_ids = stream_info.iloc[:, 3].unique()
     if vdt_file is None:
         max_depths = [fldmx] * len(stream_ids)
     else:
-        if Path(vdt_file).suffix in {'parquet', 'pq'}:
+        if Path(vdt_file).suffix in {'.parquet', '.pq'}:
             vdt_df = pd.read_parquet(vdt_file)
         else:
             vdt_df = pd.read_csv(vdt_file)
@@ -749,9 +751,9 @@ def build_fldpln_library(
 
     df = pd.concat(dfs, ignore_index=True)
     dfs = None
-    df = df.sort_values(['FSP', 'FPP'], ignore_index=True)
+    df = df.sort_values(['DTF', 'fill depth', 'FSP', 'FPP'], ignore_index=True) # Sorting like this allows very nice compression
     df = df.round(3)
-    if Path(library_file).suffix in {'parquet', 'pq'}:
+    if Path(library_file).suffix in {'.parquet', '.pq'}:
         df.to_parquet(library_file, compression='brotli', index=False, store_decimal_as_integer=True)
     else:
         df.to_csv(library_file, index=False)
@@ -760,7 +762,7 @@ def make_dtf_map(filled_dem_file: str, fldpln_library_file: str, output_file: st
     filled_dem_array: np.ndarray = gdal.Open(filled_dem_file).ReadAsArray()
     nrows, ncols = filled_dem_array.shape
 
-    if Path(fldpln_library_file).suffix == '.parquet':
+    if Path(fldpln_library_file).suffix in {'.parquet', '.pq'}:
         df = pd.read_parquet(fldpln_library_file)
     else:
         df = pd.read_csv(fldpln_library_file)
@@ -987,8 +989,8 @@ def make_flood_map(
     # merge the two dataframes on the row and column indices
     fldpln_library = pd.merge(fldpln_library, vdt_df, on='FSP', how='inner')
     fldpln_library['DTF'] = fldpln_library['DoF'] - fldpln_library['DTF']
-    fldpln_library = fldpln_library.groupby(['FPP'], as_index=False).agg({'DTF': 'max', 'sink fill depth': 'first'})
-    fldpln_library['DTF'] = fldpln_library['DTF'] + fldpln_library['sink fill depth']
+    fldpln_library = fldpln_library.groupby(['FPP'], as_index=False).agg({'DTF': 'max', 'fill depth': 'first'})
+    fldpln_library['DTF'] = fldpln_library['DTF'] + fldpln_library['fill depth']
 
     wse_array = np.full_like(dem, np.nan, dtype=np.float32)
     fsp = fldpln_library['FPP'].astype(int)
