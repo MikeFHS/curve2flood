@@ -791,16 +791,17 @@ def Create_Topobathy_Dataset(
     invalid = (Bathy <= -98.99) | np.isnan(Bathy)
 
     use_weight = invalid & (total_weight > 1e-10)
-    use_dem    = ~use_weight
+    use_dem    = invalid & ~use_weight
 
     filled[use_weight] = bathy_times_weight[use_weight] / total_weight[use_weight]
     filled[use_dem] = E[use_dem]
 
     # 3) Optional extra smoothing (you can keep or weaken this)
     # We smooth using a fun math trick, only within the AR bathy mask, to avoid smoothing the banks in!.
+    window_size = 3
     weighted = np.where(ARBathyMask, filled, 0)
-    value_sum = uniform_filter(weighted, size=5) * 5
-    count = uniform_filter(ARBathyMask.astype(np.float32), size=5) * 5
+    value_sum = uniform_filter(weighted, size=window_size, mode='nearest') * window_size
+    count = uniform_filter(ARBathyMask.astype(np.float32), size=window_size, mode='nearest') * window_size
     np.divide(value_sum, count, out=filled, where=count > 0)
 
     # 4) Outside the AR bathy mask, always use DEM
