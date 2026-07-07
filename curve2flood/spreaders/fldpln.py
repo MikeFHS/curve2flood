@@ -48,15 +48,15 @@ INFLOW = np.array([4, 8, 16, 2, 32, 1, 128, 64], dtype=np.int32)
 # MATLAB
 # INFLOW = np.array([2, 4, 8, 1, 16, 128, 64, 32], dtype=np.int32)
 
-@register_jitable(cache=True, nogil=True)
+@register_jitable(cache=True, nogil=True, forceinline=True)
 def _pixel_to_rc(pixel: int, ncols: int) -> tuple[int, int]:
     return pixel // ncols, pixel % ncols
 
-@register_jitable(cache=True, nogil=True)
+@register_jitable(cache=True, nogil=True, forceinline=True)
 def _rc_to_pixel(row: int, col: int, ncols: int) -> int:
     return np.int32(row * ncols + col)
 
-@njit(cache=True, nogil=True)
+@register_jitable(cache=True, nogil=True)
 def _valid_neighbors(pixel: int, nrows: int, ncols: int):
     row, col = _pixel_to_rc(pixel, ncols)
     out = []
@@ -211,13 +211,13 @@ def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
     while queue:
         center = queue.pop()
         for pos, nbr in _valid_neighbors(center, nrows, ncols):
-            if nbr in visited or nbr in excluded:
-                continue
             if flood_members is not None and nbr in flood_members:
                 continue
             if fil[nbr] == bg or fil[nbr] > max_wse:
                 continue
             if fdr[nbr] != INFLOW[pos]:
+                continue
+            if nbr in visited or nbr in excluded:
                 continue
             dtf = base_dtf + max(0.0, fil[nbr] - source_elev)
             visited.add(np.int32(nbr))
@@ -227,62 +227,26 @@ def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
     return result
 
 @njit(cache=True, nogil=True)
-def sort_boundary(lst: list, fil: np.ndarray) -> list:
-    # This is a numba-compatible sort, since numba cannot cache .sort(key=lambda x: (x[2], -fil[x[1]]
-    def key_func(x):
-        return x[2], -fil[x[1]]  # Sort by spillover, than elevation
-
-    for i in range(1, len(lst)):
-        current_item = lst[i]
-        current_key = key_func(current_item)
-        j = i - 1
-        
-        while j >= 0 and key_func(lst[j]) < current_key:
-            lst[j + 1] = lst[j]
-            j -= 1
-        lst[j + 1] = current_item
-        
-    return lst
-
-@njit(cache=True, nogil=True)
-def sort_candidates(lst: list) -> list:
-    # This is a numba-compatible sort, since numba cannot cache .sort(key=lambda x: (x[2], -x[4]))
-    def key_func(x):
-        return x[2], -x[4]  # Sort by spillover, than elevation
-
-    for i in range(1, len(lst)):
-        current_item = lst[i]
-        current_key = key_func(current_item)
-        j = i - 1
-        
-        while j >= 0 and key_func(lst[j]) < current_key:
-            lst[j + 1] = lst[j]
-            j -= 1
-        lst[j + 1] = current_item
-        
-    return lst
-
-@njit(cache=True, nogil=True)
-def _initial_boundary(records: dict[int, tuple[int, float]], fil: np.ndarray,
-              nrows: int, ncols: int, bg: float) -> list[tuple[int, int, float]]:
+def _initialize_boundary(new_boundary: set, records: dict[int, tuple[int, float]], fil: np.ndarray,
+                   nrows: int, ncols: int, bg: float) -> list[tuple[int, int, float]]:
     out: list[tuple[int, int, float]] = []
-    for pixel, (fsp, dtf) in records.items():
-        if fil[pixel] == bg:
-            continue
+    for pixel in new_boundary:
+        fsp, dtf = records[pixel]
         for _, nbr in _valid_neighbors(pixel, nrows, ncols):
             if nbr not in records and fil[nbr] != bg:
                 out.append((fsp, pixel, dtf))
-                break
-    out = sort_boundary(out, fil)
+
+
     return out
 
+
 @njit(cache=True, nogil=True)
-def _update_boundary(records: dict[int, tuple[int, float]], filled_dem: np.ndarray, new_boundary: set[int]) -> list[tuple[int, int, float]]:
+def _update_boundary(records: dict[int, tuple[int, float]], new_boundary: set[int]) -> list[tuple[int, int, float]]:
     bdy = [
         (records[p][0], p, records[p][1])
         for p in new_boundary
     ]
-    bdy = sort_boundary(bdy, filled_dem)
+
     return bdy
 
 @njit(cache=True, nogil=True)
@@ -323,7 +287,7 @@ def _spill_candidates(boundary: list[tuple[int, int, float]], records: dict[int,
         (fsp, spill_dtf, pixel, pixel_elev, bdy_elev)
         for pixel, (_, bdy_elev, fsp, spill_dtf, pixel_elev) in best.items()
     ]
-    candidates = sort_candidates(candidates)
+
     return candidates
 
 @njit(cache=True, nogil=True)
@@ -384,9 +348,11 @@ def _fldpln_library_for_segment(shape: tuple[int, int],
     excluded = _downstream_exclusion(stream_id, stream_info, flow_direction, nrows, ncols)
 
     records: dict[int, tuple[int, float]] = {}
+    new_boundary = set()
     for pixel in stream_pixels:
         if filled_dem[pixel] != bg:
             records[pixel] = (pixel, 0.0)
+            new_boundary.add(np.int32(pixel))
 
     fldht = 0.0
     iterations = int(np.ceil(fldmx / dh))
@@ -396,8 +362,9 @@ def _fldpln_library_for_segment(shape: tuple[int, int],
     for _ in range(iterations):
         fldht += min(dh, fldmx - fldht)
 
-        boundary = _initial_boundary(records, filled_dem, nrows, ncols, bg)
-        new_boundary = set()
+        boundary = _initialize_boundary(new_boundary, records, filled_dem, nrows, ncols, bg)
+        new_boundary.clear()
+        new_spill_boundary = set()
         _flood_map(records, flood_depths, fldmn)
         flood_members = set(records)
 
@@ -412,10 +379,15 @@ def _fldpln_library_for_segment(shape: tuple[int, int],
                 if _assimilate(records, fsp, pixel, dtf):
                     flood_depths[pixel] = max(fldmn, dtf)
                     flood_members.add(np.int32(pixel))
-                    new_boundary.add(np.int32(pixel))
+                    new_spill_boundary.add(np.int32(pixel))
 
-        boundary = _update_boundary(records, filled_dem, new_boundary)
+        new_boundary.update(new_spill_boundary)
+        for _, p, _ in boundary:
+            new_boundary.add(np.int32(p))
+
+        boundary = _update_boundary(records, new_spill_boundary)
         spill = True
+
         while spill:
             before = len(records)
             _flood_map(records, flood_depths, fldmn)
@@ -423,7 +395,7 @@ def _fldpln_library_for_segment(shape: tuple[int, int],
                 boundary, records, filled_dem, nrows, ncols, fldht, global_max_wse, bg, excluded
             )
 
-            new_boundary.clear()
+            new_spill_boundary.clear()
 
             for fsp, spill_dtf, pixel, pixel_elev, _ in candidates:
                 path = _forward_path(pixel, spill_dtf, filled_dem, flow_direction, flood_depths, nrows, ncols, bg, excluded)
@@ -445,9 +417,10 @@ def _fldpln_library_for_segment(shape: tuple[int, int],
 
                 for new_pixel, local_dtf in pending:
                     if _assimilate(records, fsp, new_pixel, local_dtf + spill_dtf):
-                        new_boundary.add(np.int32(new_pixel))
+                        new_spill_boundary.add(np.int32(new_pixel))
 
-            boundary = _update_boundary(records, filled_dem, new_boundary)
+            new_boundary.update(new_spill_boundary)
+            boundary = _update_boundary(records, new_spill_boundary)
             if iterative_spill:
                 has_shallow_boundary = False
 
