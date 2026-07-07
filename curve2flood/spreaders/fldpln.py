@@ -877,11 +877,10 @@ def make_flood_map(
 
     fdr = fdr.ravel()
     stream_rows: dict[list[tuple]] = defaultdict(list)
-    stream_info_dict = stream_info_df.set_index('source_id_col').to_dict(orient='index')
+    stream_info_dict = stream_info_df.set_index('stream_id').to_dict(orient='index')
 
     # We need to traverse each stream segment, and add missing FSPs to the vdt_df with interpolated DoF values.
     for stream_id in tqdm.tqdm(stream_ids):
-        # row = stream_info_df.loc[stream_info_df['source_id_col'] == stream_id, ['start_pixel', 'length']]
         if stream_id not in stream_info_dict:
             raise ValueError(f"Stream ID {stream_id} not found in stream_info_df.")
 
