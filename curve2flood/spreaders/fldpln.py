@@ -1,15 +1,19 @@
 from __future__ import annotations
+
+import geopandas as gpd
+import multiprocessing as mp
+from collections import defaultdict
 from pathlib import Path
 from multiprocessing import shared_memory
 
 import tqdm
 import numpy as np
+import polars as pl
 import pandas as pd
 import networkx as nx
 from numba import njit
 from osgeo import gdal
-import geopandas as gpd
-import multiprocessing as mp
+from numba.extending import register_jitable
 
 _SHARED_MEMORYS = {}
 
@@ -38,11 +42,17 @@ NEIGHBOR_DELTAS = (
 # 16  x   1
 # 8   4   2
 
-@njit(cache=True, nogil=True)
+# Whitebox
+INFLOW = np.array([4, 8, 16, 2, 32, 1, 128, 64], dtype=np.int32)
+
+# MATLAB
+# INFLOW = np.array([2, 4, 8, 1, 16, 128, 64, 32], dtype=np.int32)
+
+@register_jitable(cache=True, nogil=True)
 def _pixel_to_rc(pixel: int, ncols: int) -> tuple[int, int]:
     return pixel // ncols, pixel % ncols
 
-@njit(cache=True, nogil=True)
+@register_jitable(cache=True, nogil=True)
 def _rc_to_pixel(row: int, col: int, ncols: int) -> int:
     return np.int32(row * ncols + col)
 
@@ -57,7 +67,7 @@ def _valid_neighbors(pixel: int, nrows: int, ncols: int):
             out.append((pos, _rc_to_pixel(rr, cc, ncols)))
     return out
 
-@njit(cache=True, nogil=True)
+@register_jitable(cache=True, nogil=True)
 def _next_downstream(pixel: int, fdr: np.ndarray, nrows: int, ncols: int) -> int:
     # ESRI D8
     # OUTFLOW = {
@@ -191,12 +201,6 @@ def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
     backfill pass in the MATLAB code. Spillover backfill passes leave it as None
     so existing pixels can be overwritten when the new DTF is lower.
     """
-    # Whitebox
-    INFLOW = np.array([4, 8, 16, 2, 32, 1, 128, 64], dtype=np.int32)
-
-    # MATLAB
-    # INFLOW = np.array([2, 4, 8, 1, 16, 128, 64, 32], dtype=np.int32)
-
     source_elev = fil[source]
     result: list[tuple[int, float]] = []
     queue: list[int] = [source]
@@ -790,23 +794,107 @@ def make_dtf_map(filled_dem_file: str, fldpln_library_file: str, output_file: st
     out_ds.FlushCache()
     out_ds = None
 
+def limit_rise(arr, max_rise=0.5):
+    """
+    Limit upward rises in a 1D array.
+
+    Parameters
+    ----------
+    arr : array-like
+        Elevation values. np.nan indicates missing values.
+    max_rise : float
+        Maximum allowed rise per step.
+
+    Returns
+    -------
+    np.ndarray
+    """
+    out = np.asarray(arr, dtype=float).copy()
+
+    last_val = np.nan
+    distance = 0
+
+    for i in range(len(out)):
+        if np.isnan(out[i]):
+            distance += 1
+            continue
+
+        if np.isnan(last_val):
+            last_val = out[i]
+            distance = 0
+            continue
+
+        distance += 1
+        max_allowed = last_val + max_rise * distance
+
+        if out[i] > max_allowed:
+            out[i] = max_allowed
+
+        last_val = out[i]
+        distance = 0
+
+    return out
+
+def longest_path_decomposition(G: nx.DiGraph, stream_wse_dict: dict[int, list[tuple[int, float]]]) -> list[list[int]]:
+    """
+    Decompose a DAG into disjoint longest headwater->outlet paths.
+
+    Returns
+    -------
+    list[list]
+        Each element is a list of stream IDs ordered upstream->downstream.
+    """
+    paths = []
+    length = {sid: len(stream_wse_dict[sid]) for sid in G}
+
+    while G.nodes:
+        topo = list(nx.topological_sort(G))
+
+        longest = {}
+
+        for node in reversed(topo):
+            children = list(G.successors(node))
+
+            if not children:
+                longest[node] = (length[node], [node])
+            else:
+                best = max(
+                    (longest[c] for c in children),
+                    key=lambda x: x[0]
+                )
+                longest[node] = (length[node] + best[0], [node] + best[1])
+
+        # Find longest path beginning at a headwater
+        headwaters = [n for n in G if G.in_degree(n) == 0]
+
+        _, path = max(
+            (longest[h] for h in headwaters),
+            key=lambda x: x[0]
+        )
+
+        paths.append(path)
+
+        G.remove_nodes_from(path)
+
+    return paths
+
 def make_flood_map(
         dem: np.ndarray,
         filled_dem: np.ndarray,
-        vdt_df: pd.DataFrame,
+        vdt_df: pl.DataFrame,
         fdr: np.ndarray,
-        fldpln_library: pd.DataFrame,
+        fldpln_library: pl.LazyFrame,
         stream_info_df: pd.DataFrame,
         stream_gdf: gpd.GeoDataFrame,
-        dem_with_bathymetry: np.ndarray):
+        dem_with_bathymetry: np.ndarray,
+        max_wse_rise: float = 0.01):
     nrows, ncols = filled_dem.shape
-    vdt_df['DoF'] = vdt_df['WSE'] - filled_dem[vdt_df['Row'], vdt_df['Col']]
-    vdt_df['FSP'] = (vdt_df['Row'] * ncols + vdt_df['Col']).astype(int)
+
+    vdt_df = vdt_df.with_columns(FSP=(pl.col('Row') * ncols + pl.col('Col')).cast(pl.Int32))
+    fsp_wse_dict = dict(zip(vdt_df['FSP'], vdt_df['WSE']))
     stream_ids = set(vdt_df['COMID'])
-    existing_fsps = set(vdt_df['FSP'])
 
     stream_gdf = stream_gdf.sort_values('topological_order')
-    stream_ids = stream_gdf['LINKNO']
     G = nx.from_pandas_edgelist(
         stream_gdf[stream_gdf['DSLINKNO'] > 0],
         source='LINKNO',
@@ -815,188 +903,87 @@ def make_flood_map(
     )
 
     fdr = fdr.ravel()
-    last_dof_dict = {}
-    rows_to_add = []
+    stream_rows: dict[list[tuple]] = defaultdict(list)
+    stream_info_dict = stream_info_df.set_index('source_id_col').to_dict(orient='index')
 
     # We need to traverse each stream segment, and add missing FSPs to the vdt_df with interpolated DoF values.
-    last_dof = np.inf
-    for stream_id in stream_ids:
-        row = stream_info_df.loc[stream_info_df['source_id_col'] == stream_id, ['start_pixel', 'length']]
-        if row.empty:
-            continue
+    for stream_id in tqdm.tqdm(stream_ids):
+        # row = stream_info_df.loc[stream_info_df['source_id_col'] == stream_id, ['start_pixel', 'length']]
+        if stream_id not in stream_info_dict:
+            raise ValueError(f"Stream ID {stream_id} not found in stream_info_df.")
 
-        if stream_id not in vdt_df['COMID'].values:
-            last_dof_dict[stream_id] = last_dof
-            continue
-        info = row.values[0]
-        fsp = info[0]
-        length = info[1]
-        to_do = []
-        last_fsp = None
+        fsp = stream_info_dict[stream_id]['start_pixel']
+        length = stream_info_dict[stream_id]['length']
 
-        last_wse = np.inf
-        # row, col = _pixel_to_rc(fsp, ncols)
-        # for r, c in zip(*np.where(streams[row-1:row+2, col-1:col+2] > 0)):
-        #     potential_upstream_id = streams[row-1+r, col-1+c]
-        #     if potential_upstream_id == stream_id:
-        #         continue
-        #     upstream_dof = last_dof_dict.get(potential_upstream_id, np.inf)
-        #     interped_wse = upstream_dof + filled_dem[_pixel_to_rc(fsp, ncols)]
-        #     if interped_wse < last_wse:
-        #         last_wse = interped_wse
-        if last_wse == np.inf and (preds := list(G.predecessors(stream_id))):
-            while preds:
-                should_break = False
-                for pred in preds:
-                    if pred in last_dof_dict:
-                        last_wse = last_dof_dict[pred] + filled_dem[_pixel_to_rc(fsp, ncols)]
-                        should_break = last_wse != np.inf
-                        if should_break:
-                            break
-                if should_break:
-                    break
-                preds = [p for pred in preds for p in G.predecessors(pred)]
-
-        wses = []
-        wses_raw = []
-        xs = []
-        elevs = []
-        bathys = []
-        for i in range(length):
-            if fsp in existing_fsps:
-                raw_wse = vdt_df.loc[vdt_df['FSP'] == fsp, 'WSE'].values[0]
-                if to_do:
-                    if last_fsp is None:
-                        # No values at the beginning of a segment; just use a constant WSE. Worst case is we underestimate these pixels
-                        current_wse = vdt_df.loc[vdt_df['FSP'] == fsp, 'WSE'].values[0]
-                        if current_wse < last_wse:
-                            last_wse = current_wse
-                        elif current_wse > last_wse + 0.1: # ALlow downstream to rise 10 cm
-                            # Reassign wse
-                            current_wse = last_wse
-                            vdt_df.loc[vdt_df['FSP'] == fsp, 'WSE'] = last_wse
-                            vdt_df.loc[vdt_df['FSP'] == fsp, 'DoF'] = last_wse - filled_dem[_pixel_to_rc(fsp, ncols)]
-
-                        for fsp_to_add in to_do:
-                            rows_to_add.append((
-                                fsp_to_add,
-                                current_wse - filled_dem[_pixel_to_rc(fsp_to_add, ncols)],
-                            ))
-                            wses.append(current_wse)
-                            xs.append(i)
-                            elevs.append(filled_dem[_pixel_to_rc(fsp_to_add, ncols)])
-                            bathys.append(dem_with_bathymetry[_pixel_to_rc(fsp_to_add, ncols)])
-                            wses_raw.append(np.nan)
-                    else:
-                        last_wse_before_update = last_wse
-                        # Interpolate DoF values for the missing FSPs between last and fsp
-                        current_wse = vdt_df.loc[vdt_df['FSP'] == fsp, 'WSE'].values[0]
-                        if current_wse < last_wse:
-                            last_wse = current_wse
-                        elif current_wse > last_wse + 0.1: # ALlow downstream to rise 10 cm
-                            # Reassign wse
-                            current_wse = last_wse
-                            vdt_df.loc[vdt_df['FSP'] == fsp, 'WSE'] = last_wse
-                            vdt_df.loc[vdt_df['FSP'] == fsp, 'DoF'] = last_wse - filled_dem[_pixel_to_rc(fsp, ncols)]
-
-                        for j, fsp_to_add in enumerate(to_do, start=1):
-                            WSE = np.interp(j, [0, len(to_do) + 1], [last_wse_before_update, current_wse])
-                            rows_to_add.append((
-                                fsp_to_add,
-                                WSE - filled_dem[_pixel_to_rc(fsp_to_add, ncols)],
-                            ))
-                            wses.append(WSE)
-                            xs.append(i)
-                            elevs.append(filled_dem[_pixel_to_rc(fsp_to_add, ncols)])
-                            bathys.append(dem_with_bathymetry[_pixel_to_rc(fsp_to_add, ncols)])
-                            wses_raw.append(np.nan)
-                    to_do = []
-                    wses_raw.pop()
-                    wses_raw.append(raw_wse)
-                else:
-                    current_wse = vdt_df.loc[vdt_df['FSP'] == fsp, 'WSE'].values[0]
-                    wses_raw.append(current_wse)
-                    if current_wse < last_wse:
-                        last_wse = current_wse
-                    elif current_wse > last_wse + 0.1: # ALlow upstream to rise 10 cm
-                        current_wse = last_wse
-                        # Reassign wse
-                        vdt_df.loc[vdt_df['FSP'] == fsp, 'WSE'] = last_wse
-                        vdt_df.loc[vdt_df['FSP'] == fsp, 'DoF'] = last_wse - filled_dem[_pixel_to_rc(fsp, ncols)]
-                    wses.append(current_wse)
-                    xs.append(i)
-                    elevs.append(filled_dem[_pixel_to_rc(fsp, ncols)])
-                    bathys.append(dem_with_bathymetry[_pixel_to_rc(fsp, ncols)])
-
-                last_fsp = fsp
+        for _ in range(length):
+            if fsp in fsp_wse_dict:
+                raw_wse = fsp_wse_dict[fsp]
+                stream_rows[stream_id].append((fsp, raw_wse))
             else:
-                to_do.append(fsp)
+                stream_rows[stream_id].append((fsp, np.nan))
 
             fsp = _next_downstream(fsp, fdr, nrows, ncols)
             if fsp == -1:
                 break
 
-        if to_do and last_fsp is not None:
-            # No values at the end of a segment; use the same DoF as the last known pixel, and ensure that it is no deeper than the last wse
-                dof_last = vdt_df.loc[vdt_df['FSP'] == last_fsp, 'DoF'].values[0]
-                for fsp_to_add in to_do:
-                    elev = filled_dem[_pixel_to_rc(fsp_to_add, ncols)]
-                    last_wse = min(elev + dof_last, last_wse)
-                    rows_to_add.append((
-                        fsp_to_add,
-                        last_wse - elev,
-                    ))
-                    wses.append(last_wse)
-                    xs.append(i)
-                    elevs.append(elev)
-                    wses_raw.append(np.nan)
-                    bathys.append(dem_with_bathymetry[_pixel_to_rc(fsp_to_add, ncols)])
+    wse_array = np.full_like(dem, np.nan, dtype=np.float32)
+    if not stream_rows:
+        return wse_array
+    
+    # Let us combine stream ids that follow the main stems in the Graph
+    paths = longest_path_decomposition(G, stream_rows)
 
-        last_dof = last_wse - filled_dem[_pixel_to_rc(last_fsp, ncols)]
-        last_dof_dict[stream_id] = last_dof
+    row_chunks = []
+    for path in paths:
+        path_rows = []
+        for stream_id in path:
+            path_rows.extend(stream_rows[stream_id])
+    
+        if not path_rows:
+            continue
 
-        # import matplotlib.pyplot as plt
-        # mask = ~np.isnan(wses_raw)
+        Y = np.array([wse for _, wse in path_rows])
+        mask = ~np.isnan(Y)
+        X = np.arange(len(Y))
 
-        # def butter_lowpass_filter(data, cutoff, fs, order=4):
-        #     nyq = 0.5 * fs 
-        #     normal_cutoff = cutoff / nyq
-        #     b, a = butter(order, normal_cutoff, btype='low', analog=False)
-        #     return filtfilt(b, a, data, padlen=min(3 * max(len(b), len(a)), len(data) - 1))
+        mask = ~np.isnan(Y)
 
-        # fs = 100        
-        # cutoff = 2.0    
+        kernel_size = 3
+        kernel = np.ones(kernel_size) / kernel_size
+        smoothed_mean = np.convolve(np.asarray(Y)[mask], kernel, mode='same')
 
-        # smoothed = butter_lowpass_filter(np.asarray(wses_raw)[mask], cutoff=cutoff, fs=fs)
+        # Fix boundary effects by extrapolating the mean filter to the edges
+        smoothed_mean[:kernel_size//2] = smoothed_mean[kernel_size//2]
+        smoothed_mean[-kernel_size//2:] = smoothed_mean[-kernel_size//2-1]
 
-        # plt.plot(xs, wses, label='Selected WSE')
-        # plt.plot(xs, elevs, label='DEM Elevation', color='black')
-        # plt.plot(xs, wses_raw, label='Raw WSE', color='red', linestyle='dashed')
-        # plt.plot(xs, bathys, label='Bathymetry', color='blue', linestyle='solid')
-        # plt.title(f"Water Surface Elevation, Thalweg, and Bathymetry Thalweg across {stream_id}")
-        # plt.xlabel('Pixel Index (1 pixel = 30m)')
-        # plt.ylabel('Elevation (m)')
-        # plt.legend()
-        # plt.show()
+        mean_limited = limit_rise(smoothed_mean, max_rise=max_wse_rise)
 
-    vdt_df = vdt_df[['FSP', 'DoF']].copy()
-    if rows_to_add:
-        vdt_df = pd.concat([vdt_df, pd.DataFrame(rows_to_add, columns=['FSP', 'DoF'])], ignore_index=True)
+        # Linearly interpolate the missing values in mean limited
+        mean_limited = np.interp(X, X[mask], mean_limited)
 
-    max_DoF = vdt_df['DoF'].max()
-    fldpln_library = fldpln_library[fldpln_library['DTF'] < max_DoF]
+        row_chunks.extend([(fsp, wse - dem[_pixel_to_rc(fsp, ncols)]) for (fsp, _), wse in zip(path_rows, mean_limited)])
+
+    df = pl.LazyFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32}, orient='row')
 
     # merge the two dataframes on the row and column indices
-    fldpln_library = pd.merge(fldpln_library, vdt_df, on='FSP', how='inner')
-    fldpln_library['DTF'] = fldpln_library['DoF'] - fldpln_library['DTF']
-    fldpln_library = fldpln_library.groupby(['FPP'], as_index=False).agg({'DTF': 'max', 'fill depth': 'first'})
-    fldpln_library['DTF'] = fldpln_library['DTF'] + fldpln_library['fill depth']
+    fldpln_library = fldpln_library.join(df, on='FSP', how='inner')
+    fldpln_library = fldpln_library.with_columns(
+        DTF=(pl.col('DoF') - pl.col('DTF'))
+    )
+    fldpln_library = fldpln_library.group_by('FPP').agg([
+        pl.max('DTF'),
+        pl.first('fill depth')
+    ])
+    fldpln_library = fldpln_library.with_columns(
+        DTF=(pl.col('DTF') + pl.col('fill depth'))
+    )
 
-    wse_array = np.full_like(dem, np.nan, dtype=np.float32)
-    fsp = fldpln_library['FPP'].astype(int)
-    rows = (fsp // ncols).astype(int)
-    cols = (fsp % ncols).astype(int)
-    wse_array[rows, cols] = fldpln_library['DTF'].values + dem[rows, cols]
+    fldpln_library: pl.DataFrame = fldpln_library.collect()
+
+    fsp = fldpln_library['FPP'].to_numpy()
+    rows = fldpln_library.with_columns(Row=(pl.col('FPP') // ncols).cast(pl.Int32))['Row'].to_numpy()
+    cols = fldpln_library.with_columns(Col=(pl.col('FPP') % ncols).cast(pl.Int32))['Col'].to_numpy()
+    wse_array[rows, cols] = fldpln_library['DTF'].to_numpy() + dem[rows, cols]
     mask = (dem_with_bathymetry > -9998) & (wse_array > dem_with_bathymetry)
     wse_array[~mask] = np.nan
 

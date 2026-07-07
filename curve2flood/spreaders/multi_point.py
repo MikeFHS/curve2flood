@@ -5,7 +5,7 @@ import pandas as pd
 from osgeo import gdal, osr, ogr, gdal_array
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
-from shapely.geometry import Point
+from shapely.geometry import Point, shape
 
 from curve2flood._log import LOG
 

@@ -22,6 +22,7 @@ setup(
         "scipy",
         "numba",
         "tqdm",
+        "polars",
         "pyproj",
     ],
     entry_points={

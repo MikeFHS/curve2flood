@@ -9,7 +9,9 @@ from pathlib import Path
 import yaml
 import numpy as np
 import pandas as pd
+import polars as pl
 import geopandas as gpd
+import polars.selectors as cs
 from pyproj import CRS, Geod
 from numba.core import types
 from numba.typed import Dict
@@ -17,7 +19,7 @@ from numba import njit, prange
 from osgeo import gdal, osr, ogr
 
 from shapely.geometry import shape
-from scipy.ndimage import label, generate_binary_structure, distance_transform_edt, uniform_filter, convolve
+from scipy.ndimage import label, generate_binary_structure, distance_transform_edt, uniform_filter
 
 from curve2flood import LOG
 from curve2flood.spreaders import (
@@ -400,77 +402,72 @@ def calculate_interpolated_vdt(
         COMID_Unique_Flow: dict,
         E_DEM: np.ndarray,
         TW_MultFact: float,
-        ) -> pd.DataFrame:
+        ) -> pl.DataFrame:
     LOG.debug('\nOpening and Reading ' + VDTDatabaseFileName)
     
     # Read the VDT Database into a DataFrame
     if VDTDatabaseFileName.endswith('.parquet'):
-        vdt_df = pd.read_parquet(VDTDatabaseFileName)
+        vdt_df = pl.read_parquet(VDTDatabaseFileName)
     else:
-        vdt_df = pd.read_csv(VDTDatabaseFileName)
+        vdt_df = pl.read_csv(VDTDatabaseFileName)
         
-    if vdt_df.empty:
+    if vdt_df.is_empty():
         raise ValueError("The VDT Database file is empty or could not be read properly.")
     
     # Add COMID flow information
-    comid_flow_df = pd.DataFrame(COMID_Unique_Flow.items(), columns=['COMID', 'Flow'])
-    vdt_df = vdt_df.merge(comid_flow_df, on='COMID', how='inner').copy()
+    comid_flow_df = pl.DataFrame(data=list(COMID_Unique_Flow.items()), schema=['COMID', 'Flow'], orient='row')
+    vdt_df = vdt_df.join(comid_flow_df, on='COMID', how='inner')
 
     # Ensure row and col are integers
-    vdt_df['Row'] = vdt_df['Row'].astype(int)
-    vdt_df['Col'] = vdt_df['Col'].astype(int)
-    
-    # Extract the column indices for interpolation
-    flow_cols = [list(vdt_df.columns).index(col) for col in vdt_df.columns if col.startswith('q_')]
-    top_width_cols = [list(vdt_df.columns).index(col) for col in vdt_df.columns if col.startswith('t_')]
-    wse_cols = [list(vdt_df.columns).index(col) for col in vdt_df.columns if col.startswith('wse_')]
-    vel_cols = [list(vdt_df.columns).index(col) for col in vdt_df.columns if col.startswith('v_')]
+    vdt_df = vdt_df.with_columns([
+        pl.col('Row').cast(pl.Int32),
+        pl.col('Col').cast(pl.Int32)
+    ])
     
     # Extract flow, baseflow, elevation, and Slope values
-    flow = vdt_df['Flow'].values.astype(np.float32)
-    qb = vdt_df['QBaseflow'].values.astype(np.float32)
-    e_dem = E_DEM[vdt_df['Row'].values + 1, vdt_df['Col'].values + 1]
+    flow = vdt_df['Flow'].to_numpy().astype(np.float32, copy=False)
+    qb = vdt_df['QBaseflow'].to_numpy().astype(np.float32, copy=False)
+    e_dem = E_DEM[vdt_df['Row'].to_numpy() + 1, vdt_df['Col'].to_numpy() + 1]
 
     # Extract flow, TopWidth, and WSE values for interpolation
-    flow_values = vdt_df.iloc[:, flow_cols].values.astype(np.float32)
-    top_width_values = vdt_df.iloc[:, top_width_cols].values.astype(np.float32)
-    wse_values = vdt_df.iloc[:, wse_cols].values.astype(np.float32)
-    vel_values = vdt_df.iloc[:, vel_cols].values.astype(np.float32)
-    elev_values = vdt_df['Elev'].values.astype(np.float32)
+    flow_values = vdt_df.select(cs.starts_with('q_')).to_numpy().astype(np.float32, copy=False)
+    top_width_values = vdt_df.select(cs.starts_with('t_')).to_numpy().astype(np.float32, copy=False)
+    wse_values = vdt_df.select(cs.starts_with('wse_')).to_numpy().astype(np.float32, copy=False)
+    vel_values = vdt_df.select(cs.starts_with('v_')).to_numpy().astype(np.float32, copy=False)
+    elev_values = vdt_df['Elev'].to_numpy().astype(np.float32, copy=False)
 
     tw_scale = compute_tw_multfact_scale(flow, qb)
     tw_mult_fact = (TW_MultFact * tw_scale).astype(np.float32)
     top_width, depth, wse, velocity = vdt_interpolate(flow, qb, flow_values, top_width_values, elev_values, wse_values, vel_values, e_dem, tw_mult_fact)
 
-    # Rebuild once before adding derived columns so pandas does not keep
-    # appending blocks onto a highly fragmented wide frame.
-    vdt_df = vdt_df.assign(
-        TopWidth=top_width,
-        Depth=depth,
-        WSE=wse,
-        Velocity=velocity,
-    )
+    # Add the interpolated values back to the DataFrame
+    vdt_df = vdt_df.with_columns([
+        pl.Series('TopWidth', top_width),
+        pl.Series('Depth', depth),
+        pl.Series('WSE', wse),
+        pl.Series('Velocity', velocity),
+    ])
 
     # Drop rows with NaN values introduced during outlier removal
-    vdt_df = vdt_df.dropna(subset=['TopWidth', 'Depth', 'WSE', 'Velocity']).copy()
+    vdt_df = vdt_df.drop_nans(subset=['TopWidth', 'Depth', 'WSE', 'Velocity'])
 
     # Round the interpolated TopWidth, WSE, and Velocity to 2 decimal places
-    vdt_df = vdt_df.assign(
-        TopWidth=vdt_df['TopWidth'].round(2),
-        WSE=vdt_df['WSE'].round(2),
-        Velocity=vdt_df['Velocity'].round(2),
+    vdt_df = vdt_df.with_columns(
+        pl.col('TopWidth').round(2),
+        pl.col('WSE').round(2),
+        pl.col('Velocity').round(2),
     )
 
     # Apply the outlier filtering function to each COMID group
     cols = ['TopWidth', 'WSE', 'Velocity']
     for col in cols:
-        q01 = vdt_df.groupby('COMID')[col].transform(lambda x: x.quantile(0.01))
-        q99 = vdt_df.groupby('COMID')[col].transform(lambda x: x.quantile(0.99))
+        vdt_df = vdt_df.with_columns(
+            pl.col(col).quantile(0.01).over("COMID").alias("q01"),
+            pl.col(col).quantile(0.99).over("COMID").alias("q99"),
+        ).filter(
+            pl.col(col).is_between(pl.col("q01"), pl.col("q99"))
+        ).drop("q01", "q99")
 
-        vdt_df = vdt_df[
-            (vdt_df[col] >= q01) &
-            (vdt_df[col] <= q99)
-        ]
 
     return vdt_df
     
@@ -483,24 +480,26 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
         S_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['Slope']    
     
     # Calculate median values by COMID
-    median_values = vdt_df.groupby('COMID').agg({
-        'TopWidth': 'median',
-        'Depth': 'median',
-        'WSE': 'median',
-        'Velocity': 'median',
-    })
+    median_values = vdt_df.group_by('COMID').agg([
+        pl.col('TopWidth').median(),
+        pl.col('Depth').median(),
+        pl.col('WSE').median(),
+        pl.col('Velocity').median()
+    ])
     
     # Map results back to the unique COMID list
-    comid_result_df = pd.DataFrame({'COMID': COMID_Unique})
-    comid_result_df = comid_result_df.merge(median_values, on='COMID', how='left').fillna(0)
-    comid_result_df['COMID'] = comid_result_df['COMID'].astype(np.int32)
-    comid_result_df['TopWidth'] = comid_result_df['TopWidth'].astype(np.float32)
-    comid_result_df['Depth'] = comid_result_df['Depth'].astype(np.float32)
-    comid_result_df['Velocity'] = comid_result_df['Velocity'].astype(np.float32)
+    comid_result_df = pl.DataFrame({'COMID': COMID_Unique})
+    comid_result_df = comid_result_df.join(median_values, on='COMID', how='left').fill_nan(0)
+    comid_result_df = comid_result_df.with_columns(
+        pl.col('COMID').cast(pl.Int32),
+        pl.col('TopWidth').cast(pl.Float32),
+        pl.col('Depth').cast(pl.Float32),
+        pl.col('Velocity').cast(pl.Float32)
+    )
     
     # Create dicts
-    COMID_Unique_TW = comid_result_df.set_index('COMID')['TopWidth'].to_dict()
-    COMID_Unique_Depth = comid_result_df.set_index('COMID')['Depth'].to_dict()
+    COMID_Unique_TW = dict(zip(comid_result_df['COMID'].to_numpy(), comid_result_df['TopWidth'].to_numpy()))
+    COMID_Unique_Depth = dict(zip(comid_result_df['COMID'].to_numpy(), comid_result_df['Depth'].to_numpy()))
 
     # Get the maximum TopWidth for all COMIDs
     TopWidthMax = comid_result_df['TopWidth'].max()
@@ -766,6 +765,13 @@ def spread_Bathy(
 
     return bathy_times_weight, total_weight
 
+def uniform_smoothing(mask: np.ndarray, values: np.ndarray):
+    window_size = 3
+    weighted = np.where(mask, values, 0)
+    value_sum = uniform_filter(weighted, size=window_size, mode='nearest') * window_size
+    count = uniform_filter(mask.astype(np.float32, copy=False), size=window_size, mode='nearest') * window_size
+    np.divide(value_sum, count, out=values, where=count > 0)
+
 def Create_Topobathy_Dataset(
     E: np.ndarray,
     nrows: int,
@@ -786,38 +792,29 @@ def Create_Topobathy_Dataset(
     bathy_times_weight, total_weight = spread_Bathy(nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, Bathy, ARBathyMask)
 
     # 2) Start from original Bathy, and fill only where Bathy was invalid
-    filled = Bathy.copy()
-
     invalid = (Bathy <= -98.99) | np.isnan(Bathy)
 
     use_weight = invalid & (total_weight > 1e-10)
     use_dem    = invalid & ~use_weight
 
-    filled[use_weight] = bathy_times_weight[use_weight] / total_weight[use_weight]
-    filled[use_dem] = E[use_dem]
+    Bathy[use_weight] = bathy_times_weight[use_weight] / total_weight[use_weight]
+    Bathy[use_dem] = E[use_dem]
 
     # 3) Optional extra smoothing (you can keep or weaken this)
-    # We smooth using a fun math trick, only within the AR bathy mask, to avoid smoothing the banks in!.
-    window_size = 3
-    weighted = np.where(ARBathyMask, filled, 0)
-    value_sum = uniform_filter(weighted, size=window_size, mode='nearest') * window_size
-    count = uniform_filter(ARBathyMask.astype(np.float32), size=window_size, mode='nearest') * window_size
-    np.divide(value_sum, count, out=filled, where=count > 0)
+    # We smooth using a fun math trick, only within the AR bathy mask, to avoid smoothing the banks in!
+    uniform_smoothing(ARBathyMask, Bathy)
 
     # 4) Outside the AR bathy mask, always use DEM
     mask = ARBathyMask != 1
-    filled[mask] = E[mask]
+    Bathy[mask] = E[mask]
 
     # 5) Final safety net: any remaining bad values from DEM
-    mask = (filled <= -98.99) | (filled < -9998.0) | np.isnan(filled)
-    filled[mask] = E[mask]
+    mask = (Bathy <= -98.99) | (Bathy < -9998.0) | np.isnan(Bathy)
+    Bathy[mask] = E[mask]
     
     # 6) Honor Bathy_Use_Banks: keep bathy from being above DEM if requested
     if not Bathy_Use_Banks:
-        np.minimum(filled, E, out=filled)
-
-    # 7) Return interior (arrays are padded by 1)
-    return filled[1:nrows+1, 1:ncols+1]
+        np.minimum(Bathy, E, out=Bathy)
 
 def Calculate_Depth_TopWidth_TWMax_Velocity(params: dict, E, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, dx, dy, quiet):    # Initialize all dictionaries
     COMID_Unique_TW = {}
@@ -892,7 +889,8 @@ def make_fldpln_flood_map(
         fldpln_library,
         stream_info,
         streams_gdf,
-        dem_with_bathymetry
+        dem_with_bathymetry,
+        max_wse_rise=params['max_wse_rise'],
     )
 
     Flood_array = (wse_array > dem_with_bathymetry).astype(np.uint8)
@@ -905,13 +903,11 @@ def Curve2Flood(params: dict, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
                 TW_for_WeightBox_ElipseMask, 
                 quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast,
                 flowdir,
-                parallel,
                 filled_dem,
                 stream_info,
                 fldpln_library,
                 streams_gdf,
-                dem_with_bathymetry,
-                linkno_to_twlimit=None):
+                dem_with_bathymetry):
     if params['mapper'] == "Curve2Flood-FLDPLNpy":
         return make_fldpln_flood_map(
             params,
@@ -957,8 +953,6 @@ def Curve2Flood(params: dict, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
                                                                     flood_vdt_cells)
     elif params['mapper'] == "Curve2Flood-Multi-Point Interpolation":
         # this is the entry point for the functionality from FHS_FloodMapper_AllInOne.py that creates a flood map via multi-point inverse distance interpolation and buffering instead of the low-level raster spreading logic in CreateSimpleFloodMap.
-        if parallel:
-            LOG.warning("The Curve2Flood-Multi-Point Interpolation mapper runs at Python level and ignores the low-level parallel CreateSimpleFloodMapParallel path.")
         Flood_array, Depth_array, Slope_array, stats_message = multi_point_interpolation(
             E=E,
             B=B,
@@ -1026,7 +1020,7 @@ def Flood_WaterLC_and_STRM_Cells_in_Flood_Map(Flood_Ensemble, S, LC_array, water
 
     return Flood_Ensemble
 
-def Flood_Flooded_Cells_in_Map(Array_Ensemble, Flood_Ensemble, eps=0.01):
+def Flood_Flooded_Cells_in_Map(Array_Ensemble: np.ndarray, Flood_Ensemble: np.ndarray, eps=0.01):
     """
     This function fills NaN values in the input array (Array_Ensemble) for cells that are marked as flooded
     in the Flood_Ensemble. It uses a nearest-neighbor approach to fill NaN values from the nearest valid
@@ -1044,30 +1038,33 @@ def Flood_Flooded_Cells_in_Map(Array_Ensemble, Flood_Ensemble, eps=0.01):
     """
 
     # valid sources are flooded cells with a real (non-NaN) value
-    source_mask =  (Flood_Ensemble > 0) & (~np.isnan(Array_Ensemble))
+    flood_mask = Flood_Ensemble > 0
+    nan_mask = np.isnan(Array_Ensemble)
+    source_mask =  (flood_mask) & (~nan_mask)
+    
     # targets are flooded cells that are currently NaN
-    target_mask = (Flood_Ensemble > 0) & (np.isnan(Array_Ensemble))
+    target_mask = (flood_mask) & (nan_mask)
 
     # Copy to avoid modifying original array (optional)
-    filled = Array_Ensemble.copy().astype(np.float32)
+    filled = Array_Ensemble.astype(np.float32, copy=True)
 
     # find the closest depth or WSE values from valid source cells
     if np.any(source_mask):
         # EDT returns indices of the nearest ZERO in the input,
         # so pass the inverse to point toward TRUE source cells.
-        _, (ny, nx) = distance_transform_edt(~source_mask, return_indices=True)
+        ny, nx = distance_transform_edt(~source_mask, return_distances=False, return_indices=True)
         # nearest neighbor values from donors
         nn_vals = Array_Ensemble[ny, nx]
         filled[target_mask] = nn_vals[target_mask]
 
     # If anything inside Flood_Ensemble is STILL NaN, give it a tiny positive depth
     # (this happens when a flooded blob has zero donors anywhere)
-    still_nan = (Flood_Ensemble > 0) & np.isnan(filled)
+    still_nan = (flood_mask) & np.isnan(filled)
     if np.any(still_nan):
         filled[still_nan] = eps
 
     # keep everything outside Flood_Ensemble as NaN
-    filled[(Flood_Ensemble <= 0) & (~np.isnan(filled))] = np.nan
+    filled[Flood_Ensemble <= 0] = np.nan
     
     return filled    
 
@@ -1109,44 +1106,13 @@ def remove_cells_not_connected(flood_array: np.ndarray, streams_array: np.ndarra
     # Keep only connected chunks in flood_array
     return flood_array * mask
 
-def read_geometry_and_get_linkno_mappings(Strm_gdf: gpd.GeoDataFrame, 
-                                 COMID_Unique, 
-                                 params: dict) -> tuple[dict | None, dict | None, dict | None]:
-    linkno_to_twlimit = None
-    if Strm_gdf is None or params['mapper'] == "Curve2Flood-FLDPLNpy":
-        return linkno_to_twlimit
-    
-    # Read the shapefile
-    # filter the Strm_gdf to only include the COMIDs in the COMID_Unique array
-    Strm_gdf = Strm_gdf[Strm_gdf['LINKNO'].isin(COMID_Unique)]
-
-    # change the TopWidthPlausibleLimit to be weighted by the stream order column in Strm_gdf
-    StrmOrder_Field = params.get('StrmOrder_Field', 'StrmOrder')
-    order_field = StrmOrder_Field if StrmOrder_Field in Strm_gdf.columns else 'StrmOrder'
-    if order_field in Strm_gdf.columns:
-        Strm_gdf['TopWidthPlausibleLimit'] = (Strm_gdf[order_field]/max(Strm_gdf[order_field].values)) * params['TopWidthPlausibleLimit']
-        # drop all columns in the GDF except for the LINKNO/COMID column and the TopWidthPlausibleLimit column
-        Strm_gdf = Strm_gdf[['LINKNO', 'TopWidthPlausibleLimit']]
-        # Build a lookup dictionary from the GDF
-        linkno_to_twlimit = Strm_gdf.set_index('LINKNO')['TopWidthPlausibleLimit'].to_dict()
-    else:
-        linkno_to_twlimit = None
-    
-    return linkno_to_twlimit
-
 def create_positive_max_array(array_list: list[np.ndarray]) -> np.ndarray:
     """Create a maximum value array from a list of arrays, ignoring NaNs."""
     # Convert list to stacked array of shape (N, rows, cols)
-    arr_stack = np.stack(array_list, axis=0).astype(np.float32)
-
-    # Positive-value mask
-    positive_mask = arr_stack > 0.0
-    masked_arr = np.ma.array(arr_stack, mask=~positive_mask)
-
-    # Max across the stack, ignoring masked values
-    max_vals = masked_arr.max(axis=0).filled(np.nan).astype(np.float32)
-    
-    return max_vals.astype(np.float32)
+    arr_stack = np.stack(array_list, axis=0, dtype=np.float32)
+    result = np.nanmax(arr_stack, where=arr_stack > 0, axis=0, initial=-np.inf)
+    result[result == -np.inf] = np.nan  # Replace -inf with NaN for cells that had no positive values
+    return result
 
 def create_depth(
                 array_list: list[np.ndarray],
@@ -1217,11 +1183,10 @@ def create_bathymetry(params: dict, E: np.ndarray, nrows: int, ncols: int, dem_g
     ARBathy[np.isnan(ARBathy)] = -99.000  #This converts all nan values to a -99
     ARBathy = ARBathy * ARBathyMask
     ARBathy[ARBathyMask != 1] = -9999.000
-    # Bathy = Create_Topobathy_Dataset(RR, CC, E, B, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, Bathy_Yes, ARBathy, ARBathyMask)
-    ARBathy = Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, ARBathy, ARBathyMask, params['Bathy_Use_Banks']).astype(np.float32)  # enforce again just in case
+    Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, ARBathy, ARBathyMask, params['Bathy_Use_Banks'])
 
     # write the Bathy output raster
-    Write_Output_Raster(params['BathyOutputFileName'], ARBathy, ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32, params['compression'], bathymetry_creation_options)
+    Write_Output_Raster(params['BathyOutputFileName'], ARBathy[1:-1, 1:-1], ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32, params['compression'], bathymetry_creation_options)
 
 def to_bool(value):
     if isinstance(value, str):
@@ -1285,6 +1250,7 @@ def get_params(input_file: str = None, args: dict = None):
         'Filled_DEM_File': data.get('Filled_DEM_File', ''),
         'Stream_Info_File': data.get('Stream_Info_File', ''),
         'FLDPLN_Library': data.get('FLDPLN_Library', ''),
+        'max_wse_rise': float(data.get('max_wse_rise', 0.01)),
 
         # Multipoint options
         'topwidth_threshold_m': float(data.get('MPI_TopWidth_Threshold_m', 200.0)),
@@ -1341,7 +1307,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
                              quiet: bool = False,
                              flood_vdt_cells: bool = True,
                              bathymetry_creation_options: list[str] = None,
-                             parallel: bool = False,):
+                             **kwargs):
 
     """
     Main function that takes runs the flood mapping. If an input file is provided, it reads the parameters from the file.
@@ -1360,9 +1326,8 @@ def Curve2Flood_MainFunction(input_file: str = None,
         If True, includes VDT cells in the flood map.
     bathymetry_creation_options : list[str]
         List of options for bathymetry raster creation.
-    parallel : bool
-        If True, enables parallel processing for simple floodmap. In tests, this increase flood mapping speed 2x, 
-        with a slight change in values (~0.0003% of flooded cells differ).
+    **kwargs
+        Additional keyword arguments, for backwards compatibility with older versions of the function that may have used different parameter names.
 
     """
     params = get_params(input_file, args)
@@ -1394,11 +1359,15 @@ def Curve2Flood_MainFunction(input_file: str = None,
             raise ValueError("Filled DEM raster dimensions do not match DEM dimensions.")
         
         stream_info: pd.DataFrame = pd.read_csv(params['Stream_Info_File'])
-        streams_gdf = gpd.read_file(params['StrmShp_File'], use_arrow=True, ignore_geometry=True)
-        if Path(params['FLDPLN_Library']).suffix == '.parquet':
-            fldpln_library = pd.read_parquet(params['FLDPLN_Library'])
+        if Path(params['StrmShp_File']).suffix == '.parquet':
+            streams_gdf = gpd.read_parquet(params['StrmShp_File'])
         else:
-            fldpln_library = pd.read_csv(params['FLDPLN_Library'])
+            streams_gdf = gpd.read_file(params['StrmShp_File'], use_arrow=True, ignore_geometry=True)
+
+        if Path(params['FLDPLN_Library']).suffix == '.parquet':
+            fldpln_library = pl.scan_parquet(params['FLDPLN_Library'])
+        else:
+            fldpln_library = pl.scan_csv(params['FLDPLN_Library'])
         dem_with_bathymetry = gdal.Open(params['BathyOutputFileName']).ReadAsArray()
     else:
         FlowDir = None
@@ -1468,9 +1437,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
     COMID_Unique = np.unique(B[RR, CC]) # Always sorted
     COMID_Unique = COMID_Unique.astype(int) # Ensure it's treated as integers
 
-    # Open the StrmShp_File if provided
-    linkno_to_twlimit = read_geometry_and_get_linkno_mappings(streams_gdf, COMID_Unique, params)
-
     #Order from highest to lowest flow
     LOG.info('Opening and Reading ' + params['FlowFileName'])
     num_flows = pd.read_csv(params['FlowFileName'], nrows=0).shape[1] - 1  #Subtract 1 for the COMID Column
@@ -1508,18 +1474,12 @@ def Curve2Flood_MainFunction(input_file: str = None,
         #Get an Average Flow rate associated with each stream reach.
         if params['Set_Depth'] <= 0.000000001:
             COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(params['FlowFileName'], flow_event_num)
-        Flood_array_this_flow, Depth_array, Slope_array = Curve2Flood(params, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, 
-                                                            COMID_Unique_Flow, WeightBox, 
-                                                            TW_for_WeightBox_ElipseMask, 
-                                                            quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast,
-                                                            FlowDir,
-                                                            parallel,
-                                                            filled_dem,
-                                                            stream_info,
-                                                            fldpln_library,
-                                                            streams_gdf,
-                                                            dem_with_bathymetry,
-                                                            linkno_to_twlimit=linkno_to_twlimit)        
+        Flood_array_this_flow, Depth_array, Slope_array = Curve2Flood(
+            params, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, 
+            COMID_Unique_Flow, WeightBox, TW_for_WeightBox_ElipseMask, 
+            quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, FlowDir,
+            filled_dem, stream_info, fldpln_library, streams_gdf, dem_with_bathymetry
+            )        
         Flood_array_this_flow = remove_cells_not_connected(Flood_array_this_flow, S)
         Flood_Ensemble += Flood_array_this_flow
         Depth_array_list.append(Depth_array)
@@ -1629,10 +1589,9 @@ def Curve2Flood_MainFunction(input_file: str = None,
     # We will just use the S_Rast and Flood_array to find the closest slope from S_Rast for each flooded cell
     if params['mapper'] == "Curve2Flood-FLDPLNpy" and S_Rast is not None:
         Slope_array = Flood_Flooded_Cells_in_Map(S_Rast.astype(np.float32), Flood_Ensemble.astype(np.uint8), eps=0.0002)
-        Slope_array = np.where((Slope_array <= 0), np.nan, Slope_array).astype(np.float32)
-        # smooth with Gaussian filter
-        sigma_value = 1.00
-        Slope_array = gaussian_blur_separable(Slope_array.astype(np.float32), sigma=sigma_value)
+        mask = Slope_array <= 0
+        Slope_array = np.where(mask, np.nan, Slope_array).astype(np.float32)
+        uniform_smoothing(mask, Slope_array)
         Slope_array_list = [Slope_array]
 
     if OutVEL:

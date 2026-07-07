@@ -2,11 +2,10 @@ numba
 numpy
 pandas
 gdal
-fastparquet
-rasterio
 geopandas
 pyyaml
 shapely
 scipy
 tqdm
+polars
 pyproj
