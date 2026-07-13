@@ -872,7 +872,6 @@ def make_fldpln_flood_map(
         flow_dir,
         fldpln_library,
         streams_gdf,
-        dem_with_bathymetry
         ):
     vdt_df = calculate_interpolated_vdt(
         params['VDTDatabaseFileName'],
@@ -889,12 +888,11 @@ def make_fldpln_flood_map(
         fldpln_library,
         stream_info,
         streams_gdf,
-        dem_with_bathymetry,
         max_wse_rise=params['max_wse_rise'],
     )
 
-    Flood_array = (wse_array > dem_with_bathymetry).astype(np.uint8)
-    Depth_array = np.where(Flood_array, wse_array - dem_with_bathymetry, np.nan).astype(np.float32)
+    Flood_array = (wse_array > E[1:-1, 1:-1]).astype(np.uint8)
+    Depth_array = np.where(Flood_array, wse_array - E[1:-1, 1:-1], np.nan).astype(np.float32)
 
     return Flood_array, Depth_array, None  # Slope_array is not computed in this method
 
@@ -906,8 +904,7 @@ def Curve2Flood(params: dict, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
                 filled_dem,
                 stream_info,
                 fldpln_library,
-                streams_gdf,
-                dem_with_bathymetry):
+                streams_gdf,):
     if params['mapper'] == "Curve2Flood-FLDPLNpy":
         return make_fldpln_flood_map(
             params,
@@ -918,7 +915,6 @@ def Curve2Flood(params: dict, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
             flowdir,
             fldpln_library,
             streams_gdf,
-            dem_with_bathymetry
         )
 
     # Calculate an Average Top Width and Depth for each stream reach.
@@ -1296,7 +1292,6 @@ def validate_params(params: dict):
             'Filled_DEM_File',
             'Stream_Info_File',
             'FLDPLN_Library',
-            'BathyOutputFileName'
         ])
     missing_params = [param for param in required_params if not params.get(param)]
     if missing_params:
@@ -1358,7 +1353,10 @@ def Curve2Flood_MainFunction(input_file: str = None,
             LOG.error(f"Filled DEM raster dimensions ({filled_dem.shape[1]}x{filled_dem.shape[0]}) do not match DEM dimensions ({ncols}x{nrows}).")
             raise ValueError("Filled DEM raster dimensions do not match DEM dimensions.")
         
-        stream_info: pd.DataFrame = pd.read_csv(params['Stream_Info_File'])
+        if Path(params['Stream_Info_File']).suffix == '.parquet':
+            stream_info: pd.DataFrame = pd.read_parquet(params['Stream_Info_File'])
+        else:
+            stream_info: pd.DataFrame = pd.read_csv(params['Stream_Info_File'])
         if Path(params['StrmShp_File']).suffix == '.parquet':
             streams_gdf = gpd.read_parquet(params['StrmShp_File'])
         else:
@@ -1368,14 +1366,12 @@ def Curve2Flood_MainFunction(input_file: str = None,
             fldpln_library = pl.scan_parquet(params['FLDPLN_Library'])
         else:
             fldpln_library = pl.scan_csv(params['FLDPLN_Library'])
-        dem_with_bathymetry = gdal.Open(params['BathyOutputFileName']).ReadAsArray()
     else:
         FlowDir = None
         filled_dem = None
         stream_info = None
         streams_gdf = None
         fldpln_library = None
-        dem_with_bathymetry = None
 
     LOG.info("Executing flood mapping logic...")
 
@@ -1455,8 +1451,13 @@ def Curve2Flood_MainFunction(input_file: str = None,
         num_flows = 1
     
     # Create initial rasters once, outside the loop
-    T_Rast = np.empty((nrows,ncols), np.float32)
-    W_Rast = np.empty((nrows,ncols), np.float32)
+    if params['mapper'] == "Curve2Flood-FLDPLNpy":
+        T_Rast = None
+        W_Rast = None
+    else:
+        T_Rast = np.empty((nrows,ncols), np.float32)
+        W_Rast = np.empty((nrows,ncols), np.float32)
+
     if params['OutVEL']:
         S_Rast = np.empty((nrows,ncols), np.float32)
     else:
@@ -1469,8 +1470,11 @@ def Curve2Flood_MainFunction(input_file: str = None,
     for flow_event_num in range(num_flows):
         LOG.info('Working on Flow Event ' + str(flow_event_num))
         # clear out last events values
-        T_Rast[:] = -1.0
-        W_Rast[:] = np.nan
+        if T_Rast is not None:
+            T_Rast[:] = -1.0
+        if W_Rast is not None:
+            W_Rast[:] = np.nan
+
         #Get an Average Flow rate associated with each stream reach.
         if params['Set_Depth'] <= 0.000000001:
             COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(params['FlowFileName'], flow_event_num)
@@ -1478,7 +1482,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
             params, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, 
             COMID_Unique_Flow, WeightBox, TW_for_WeightBox_ElipseMask, 
             quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, FlowDir,
-            filled_dem, stream_info, fldpln_library, streams_gdf, dem_with_bathymetry
+            filled_dem, stream_info, fldpln_library, streams_gdf
             )        
         Flood_array_this_flow = remove_cells_not_connected(Flood_array_this_flow, S)
         Flood_Ensemble += Flood_array_this_flow
@@ -1557,11 +1561,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
             ds = None
 
     if OutWSE:
-        if params['mapper'] == "Curve2Flood-FLDPLNpy":
-            WSE_Array = np.where((Depth_Array > 0) & (dem_with_bathymetry > -9998.0), Depth_Array+dem_with_bathymetry, np.nan).astype(np.float32)
-        else:
-            WSE_Array = np.where((Depth_Array > 0) & (E[1:-1, 1:-1] > -9998.0), Depth_Array+E[1:-1, 1:-1], np.nan).astype(np.float32)
-
+        WSE_Array = np.where((Depth_Array > 0) & (E[1:-1, 1:-1] > -9998.0), Depth_Array+E[1:-1, 1:-1], np.nan).astype(np.float32)
         
         # --- Write GeoTIFF ---
         driver = gdal.GetDriverByName("GTiff")

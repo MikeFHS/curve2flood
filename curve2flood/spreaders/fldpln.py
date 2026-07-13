@@ -651,15 +651,18 @@ def build_fldpln_library(
     processes
         Number of worker processes to use when parallel is enabled.
     """
-    stream_info = pd.read_csv(stream_info_file)
+    if Path(stream_info_file).suffix in {'.parquet', '.pq'}:
+        stream_info = pd.read_parquet(stream_info_file)
+    else:
+        stream_info = pd.read_csv(stream_info_file)
     assert stream_info.ndim == 2, "Stream info file must be a 2D table"
     assert stream_info.shape[1] == 4, "Stream info file must have 4 columns: start pixel (0), end pixel (1), length (2), and stream ID (3)"
 
     if stream_ids is not None:
         stream_info = stream_info[stream_info.iloc[:, 3].isin(stream_ids)]
 
-    dem_array = read_array_and_set_shared(dem, np.float16, set_shared=parallel, name='dem_array')
-    filled_dem_array = read_array_and_set_shared(filled_dem, np.float16, set_shared=parallel, name='filled_dem_array')
+    dem_array = read_array_and_set_shared(dem, np.float32, set_shared=parallel, name='dem_array')
+    filled_dem_array = read_array_and_set_shared(filled_dem, np.float32, set_shared=parallel, name='filled_dem_array')
     flow_direction_array = read_array_and_set_shared(flow_direction_file, np.uint8, set_shared=parallel, name='flow_direction_array')
 
     stream_ids = stream_info.iloc[:, 3].unique()
@@ -859,7 +862,6 @@ def make_flood_map(
         fldpln_library: pl.LazyFrame,
         stream_info_df: pd.DataFrame,
         stream_gdf: gpd.GeoDataFrame,
-        dem_with_bathymetry: np.ndarray,
         max_wse_rise: float = 0.01):
     nrows, ncols = filled_dem.shape
 
@@ -880,7 +882,7 @@ def make_flood_map(
     stream_info_dict = stream_info_df.set_index('stream_id').to_dict(orient='index')
 
     # We need to traverse each stream segment, and add missing FSPs to the vdt_df with interpolated DoF values.
-    for stream_id in tqdm.tqdm(stream_ids):
+    for stream_id in stream_ids:
         if stream_id not in stream_info_dict:
             raise ValueError(f"Stream ID {stream_id} not found in stream_info_df.")
 
@@ -908,32 +910,43 @@ def make_flood_map(
     row_chunks = []
     for path in paths:
         path_rows = []
+        averages = []
         for stream_id in path:
             path_rows.extend(stream_rows[stream_id])
+            # Compute average water depth for the stream segment
+            stream_rows_data = stream_rows[stream_id]
+            if len(stream_rows_data) == 0:
+                continue
+            
+            average_depth = np.nanpercentile([wse - dem[_pixel_to_rc(fsp, ncols)] for fsp, wse in stream_rows_data], 30)
+            averages.extend([average_depth + dem[_pixel_to_rc(pixel, ncols)] for pixel, _ in stream_rows_data])
     
         if not path_rows:
             continue
 
-        Y = np.array([wse for _, wse in path_rows])
-        mask = ~np.isnan(Y)
-        X = np.arange(len(Y))
+        averages = limit_rise(averages, max_rise=max_wse_rise)
 
-        mask = ~np.isnan(Y)
+        # import matplotlib.pyplot as plt
+        # plt.figure(figsize=(12, 6))
+        # plt.plot(X, Y, label='Original WSE', color='blue')
+        # plt.plot(X, Y_interped, label='Interpolated WSE', color='blue', linestyle=':')
+        # plt.plot(X, mean_limited, label='Smoothed & Limited WSE', color='orange', linestyle='--')
+        # plt.plot(X, gaussian_smoothed, label='Gaussian Smoothed WSE', color='red', linestyle='-.')
+        # # Plot dem elevation
+        # plt.plot(X, [dem[_pixel_to_rc(fsp, ncols)] for fsp in [fsp for fsp, _ in path_rows]], label='DEM Elevation', color='green')
+        # plt.plot(X, averages, label='Average Depth + Elevation', color='purple', linestyle=':')
+        # plt.title(f'Stream Path WSE Smoothing and Limiting')
+        # plt.plot(X, depths, label='WSE - DEM Elevation', color='blue')
+        # plt.plot(X, averages, label='Average Depth + Elevation', color='purple', linestyle=':')
+        # # Plot average depth 
+        # plt.plot(X, average_depths, label='Average Depth', color='orange', linestyle='--')
+        # plt.xlabel('Pixel Index along Stream Path')
+        # plt.ylabel('Water Surface Elevation (WSE)')
+        # plt.legend()
+        # plt.grid()
+        # plt.show()
 
-        kernel_size = 3
-        kernel = np.ones(kernel_size) / kernel_size
-        smoothed_mean = np.convolve(np.asarray(Y)[mask], kernel, mode='same')
-
-        # Fix boundary effects by extrapolating the mean filter to the edges
-        smoothed_mean[:kernel_size//2] = smoothed_mean[kernel_size//2]
-        smoothed_mean[-kernel_size//2:] = smoothed_mean[-kernel_size//2-1]
-
-        mean_limited = limit_rise(smoothed_mean, max_rise=max_wse_rise)
-
-        # Linearly interpolate the missing values in mean limited
-        mean_limited = np.interp(X, X[mask], mean_limited)
-
-        row_chunks.extend([(fsp, wse - dem[_pixel_to_rc(fsp, ncols)]) for (fsp, _), wse in zip(path_rows, mean_limited)])
+        row_chunks.extend([(fsp, wse - dem[_pixel_to_rc(fsp, ncols)]) for (fsp, _), wse in zip(path_rows, averages)])
 
     df = pl.LazyFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32}, orient='row')
 
@@ -942,6 +955,7 @@ def make_flood_map(
     fldpln_library = fldpln_library.with_columns(
         DTF=(pl.col('DoF') - pl.col('DTF'))
     )
+    fldpln_library = fldpln_library.filter(pl.col('DTF') > 0)
     fldpln_library = fldpln_library.group_by('FPP').agg([
         pl.max('DTF'),
         pl.first('fill depth')
@@ -952,11 +966,10 @@ def make_flood_map(
 
     fldpln_library: pl.DataFrame = fldpln_library.collect()
 
-    fsp = fldpln_library['FPP'].to_numpy()
-    rows = fldpln_library.with_columns(Row=(pl.col('FPP') // ncols).cast(pl.Int32))['Row'].to_numpy()
-    cols = fldpln_library.with_columns(Col=(pl.col('FPP') % ncols).cast(pl.Int32))['Col'].to_numpy()
-    wse_array[rows, cols] = fldpln_library['DTF'].to_numpy() + dem[rows, cols]
-    mask = (dem_with_bathymetry > -9998) & (wse_array > dem_with_bathymetry)
+    rows = fldpln_library.with_columns(Row=(pl.col('FPP') // ncols).cast(pl.Int32))['Row']
+    cols = fldpln_library.with_columns(Col=(pl.col('FPP') % ncols).cast(pl.Int32))['Col']
+    wse_array[rows, cols] = fldpln_library['DTF'] + dem[rows, cols]
+    mask = (dem > -9998) & (wse_array > dem)
     wse_array[~mask] = np.nan
 
     return wse_array
