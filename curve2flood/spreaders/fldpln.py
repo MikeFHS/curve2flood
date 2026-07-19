@@ -15,6 +15,8 @@ from numba import njit
 from osgeo import gdal
 from numba.extending import register_jitable
 
+from curve2flood import LOG
+
 _SHARED_MEMORYS = {}
 
 # Neighbor order used in the MATLAB code:
@@ -651,6 +653,69 @@ def build_fldpln_library(
     processes
         Number of worker processes to use when parallel is enabled.
     """
+    try:
+        _build_fldpln_library(
+            dem, filled_dem, stream_info_file, flow_direction_file, library_file,
+            dh, fldmn, fldmx, iterative_spill, vdt_file, stream_ids,
+            global_max_wse, bg, parallel, pbar, processes
+        )
+    finally:
+        close_shared_memory(['dem_array', 'filled_dem_array', 'flow_direction_array'])
+
+def _build_fldpln_library(
+    dem: str,
+    filled_dem: str,
+    stream_info_file: str,
+    flow_direction_file: str,
+    library_file: str,
+    dh: float,
+    fldmn: float,
+    fldmx: float,
+    iterative_spill: bool,
+    vdt_file: str = None,
+    stream_ids: list[int] | None = None,
+    global_max_wse: float = 0.0,
+    bg: float = -9999,
+    parallel: bool = False,
+    pbar: bool = True,
+    processes: int | None = None
+):
+    """
+    Build floodplain library.
+
+    Parameters
+    ----------
+    dem: str
+        Path to the DEM raster.
+    filled_dem: str
+        Path to the filled DEM raster.
+    stream_info_file: str
+        Path to the stream info CSV file.
+    flow_direction_file: str
+        Path to the flow direction raster.
+    dh: float
+        Depth increment (meters).
+    fldmn: float
+        Minimum depth for a cell to be considered flooded (meters).
+    fldmx: float
+        Maximum floodplain depth to iterate up to (meters).
+    iterative_spill: bool
+        Whether to use iterative spill routing when generating outputs. Recommended if the DEM is high resolution (<= 10 m)
+    vdt_file: str | None
+        Optional VDT file used to derive per-stream maximum depths.
+    stream_ids: list[int] | None
+        Optional subset of COMIDs to process.
+    global_max_wse: float
+        Global maximum water-surface elevation override.
+    bg: float
+        Background/no-data value for output rasters.
+    parallel: bool
+        If True, process stream reaches using multiprocessing.
+    pbar
+        If True, display a progress bar.
+    processes
+        Number of worker processes to use when parallel is enabled.
+    """
     if Path(stream_info_file).suffix in {'.parquet', '.pq'}:
         stream_info = pd.read_parquet(stream_info_file)
     else:
@@ -683,6 +748,10 @@ def build_fldpln_library(
         ids_max_depths = vdt_df.groupby('COMID', sort=False, as_index=False)['depth'].max().values
         stream_ids = ids_max_depths[:, 0].astype(np.int32)
         max_depths = np.minimum(ids_max_depths[:, 1], fldmx)
+
+    if len(stream_ids) == 0:
+        LOG.warning("No stream segments found to process. Exiting.")
+        return
 
     if pbar:
         pbar = tqdm.tqdm
@@ -747,7 +816,7 @@ def make_dtf_map(filled_dem_file: str, fldpln_library_file: str, output_file: st
     else:
         df = pd.read_csv(fldpln_library_file)
 
-    df = df.groupby('FPP', as_index=False).agg({'DTF': 'min'})
+    df = df.groupby('FPP', as_index=False).agg({'DTF': 'mean'})
     df['Row'] = (df['FPP'] // ncols).astype(int)
     df['Col'] = (df['FPP'] % ncols).astype(int)
     df['DTF'] = df['DTF'].clip(lower=0)
@@ -862,7 +931,8 @@ def make_flood_map(
         fldpln_library: pl.LazyFrame,
         stream_info_df: pd.DataFrame,
         stream_gdf: gpd.GeoDataFrame,
-        max_wse_rise: float = 0.01):
+        max_wse_rise: float = 0.01,
+        percentile: float = 30.0):
     nrows, ncols = filled_dem.shape
 
     vdt_df = vdt_df.with_columns(FSP=(pl.col('Row') * ncols + pl.col('Col')).cast(pl.Int32))
@@ -917,8 +987,11 @@ def make_flood_map(
             stream_rows_data = stream_rows[stream_id]
             if len(stream_rows_data) == 0:
                 continue
+
+            if all(np.isnan(wse) for _, wse in stream_rows_data):
+                continue
             
-            average_depth = np.nanpercentile([wse - dem[_pixel_to_rc(fsp, ncols)] for fsp, wse in stream_rows_data], 30)
+            average_depth = np.nanpercentile([wse - dem[_pixel_to_rc(fsp, ncols)] for fsp, wse in stream_rows_data], percentile)
             averages.extend([average_depth + dem[_pixel_to_rc(pixel, ncols)] for pixel, _ in stream_rows_data])
     
         if not path_rows:
@@ -926,28 +999,44 @@ def make_flood_map(
 
         averages = limit_rise(averages, max_rise=max_wse_rise)
 
-        # import matplotlib.pyplot as plt
+        import matplotlib.pyplot as plt
+        X = np.arange(len(path_rows))
+        Y = np.array([wse for _, wse in path_rows])
+        from scipy.ndimage import median_filter
+        mask = ~np.isnan(Y)
+        wse_smoothed = median_filter(Y[mask], size=50)
+        # Interpolate smoothed values over nans
+        wse_limited = limit_rise(wse_smoothed, max_rise=max_wse_rise)
+        wse_interped = np.interp(X, X[mask], wse_limited)
+        # Limit upward rises in the smoothed values
+
+        depths = np.array([
+            wse - dem[_pixel_to_rc(pixel, ncols)]
+            for pixel, wse in path_rows
+        ])
+        depths_smoothed = median_filter(depths[mask], size=50)
+        # depths_limited = limit_rise(depths_smoothed, max_rise=max_wse_rise)
+        depths_interped = np.interp(X, X[mask], depths_smoothed)
+        # make wse interped the min of elev + depth and wse_interped
+        wse_interped = np.minimum(wse_interped, depths_interped + np.array([dem[_pixel_to_rc(pixel, ncols)] for pixel, _ in path_rows]))
+        wse_from_depths = np.fmin(depths_interped + np.array([dem[_pixel_to_rc(pixel, ncols)] for pixel, _ in path_rows]), Y)
+
+        
         # plt.figure(figsize=(12, 6))
         # plt.plot(X, Y, label='Original WSE', color='blue')
-        # plt.plot(X, Y_interped, label='Interpolated WSE', color='blue', linestyle=':')
-        # plt.plot(X, mean_limited, label='Smoothed & Limited WSE', color='orange', linestyle='--')
-        # plt.plot(X, gaussian_smoothed, label='Gaussian Smoothed WSE', color='red', linestyle='-.')
-        # # Plot dem elevation
         # plt.plot(X, [dem[_pixel_to_rc(fsp, ncols)] for fsp in [fsp for fsp, _ in path_rows]], label='DEM Elevation', color='green')
         # plt.plot(X, averages, label='Average Depth + Elevation', color='purple', linestyle=':')
+        # plt.plot(X, wse_interped, label='Smoothed and Limited WSE', color='red', linestyle='--')
+        # plt.plot(X, wse_from_depths, label='Smoothed and Limited Depth + Elevation', color='orange', linestyle='-.')
         # plt.title(f'Stream Path WSE Smoothing and Limiting')
-        # plt.plot(X, depths, label='WSE - DEM Elevation', color='blue')
-        # plt.plot(X, averages, label='Average Depth + Elevation', color='purple', linestyle=':')
-        # # Plot average depth 
-        # plt.plot(X, average_depths, label='Average Depth', color='orange', linestyle='--')
         # plt.xlabel('Pixel Index along Stream Path')
         # plt.ylabel('Water Surface Elevation (WSE)')
         # plt.legend()
         # plt.grid()
         # plt.show()
 
-        row_chunks.extend([(fsp, wse - dem[_pixel_to_rc(fsp, ncols)]) for (fsp, _), wse in zip(path_rows, averages)])
-
+        row_chunks.extend([(fsp, wse - dem[_pixel_to_rc(fsp, ncols)]) for (fsp, _), wse in zip(path_rows, wse_interped)])
+    # exit()
     df = pl.LazyFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32}, orient='row')
 
     # merge the two dataframes on the row and column indices

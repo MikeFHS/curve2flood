@@ -889,6 +889,7 @@ def make_fldpln_flood_map(
         stream_info,
         streams_gdf,
         max_wse_rise=params['max_wse_rise'],
+        percentile=params['percentile']
     )
 
     Flood_array = (wse_array > E[1:-1, 1:-1]).astype(np.uint8)
@@ -1247,6 +1248,7 @@ def get_params(input_file: str = None, args: dict = None):
         'Stream_Info_File': data.get('Stream_Info_File', ''),
         'FLDPLN_Library': data.get('FLDPLN_Library', ''),
         'max_wse_rise': float(data.get('max_wse_rise', 0.01)),
+        'percentile': float(data.get('percentile', 30.0)),
 
         # Multipoint options
         'topwidth_threshold_m': float(data.get('MPI_TopWidth_Threshold_m', 200.0)),
