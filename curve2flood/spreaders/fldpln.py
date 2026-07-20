@@ -1004,6 +1004,8 @@ def make_flood_map(
         Y = np.array([wse for _, wse in path_rows])
         from scipy.ndimage import median_filter
         mask = ~np.isnan(Y)
+        if mask.sum() == 0:
+            continue
         wse_smoothed = median_filter(Y[mask], size=50)
         # Interpolate smoothed values over nans
         wse_limited = limit_rise(wse_smoothed, max_rise=max_wse_rise)
