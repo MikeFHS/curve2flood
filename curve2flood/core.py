@@ -889,7 +889,12 @@ def make_fldpln_flood_map(
         stream_info,
         streams_gdf,
         max_wse_rise=params['max_wse_rise'],
-        percentile=params['percentile']
+        median_filter_size=params['FLDPLN_Median_Filter_Size'],
+        dof_scale=params['FLDPLN_DoF_Scale'],
+        dof_offset=params['FLDPLN_DoF_Offset'],
+        missing_fsp_interpolation=params['FLDPLN_Missing_FSP_Interpolation'],
+        dof_signal=params['FLDPLN_DoF_Signal'],
+        threshold_mode=params['FLDPLN_Threshold_Mode'],
     )
 
     Flood_array = (wse_array > E[1:-1, 1:-1]).astype(np.uint8)
@@ -1248,7 +1253,12 @@ def get_params(input_file: str = None, args: dict = None):
         'Stream_Info_File': data.get('Stream_Info_File', ''),
         'FLDPLN_Library': data.get('FLDPLN_Library', ''),
         'max_wse_rise': float(data.get('max_wse_rise', 0.01)),
-        'percentile': float(data.get('percentile', 30.0)),
+        'FLDPLN_Median_Filter_Size': int(data.get('FLDPLN_Median_Filter_Size', data.get('median_filter_size', 53))),
+        'FLDPLN_DoF_Scale': float(data.get('FLDPLN_DoF_Scale', data.get('dof_scale', 1.55))),
+        'FLDPLN_DoF_Offset': float(data.get('FLDPLN_DoF_Offset', data.get('dof_offset', -0.1))),
+        'FLDPLN_Missing_FSP_Interpolation': data.get('FLDPLN_Missing_FSP_Interpolation', data.get('missing_fsp_interpolation', 'ffill')),
+        'FLDPLN_DoF_Signal': data.get('FLDPLN_DoF_Signal', data.get('dof_signal', 'min')),
+        'FLDPLN_Threshold_Mode': data.get('FLDPLN_Threshold_Mode', data.get('threshold_mode', 'normal')),
 
         # Multipoint options
         'topwidth_threshold_m': float(data.get('MPI_TopWidth_Threshold_m', 200.0)),
@@ -1285,9 +1295,10 @@ def get_params(input_file: str = None, args: dict = None):
     return params
 
 def validate_params(params: dict):
-    required_params = [
-        'FlowFileName'
-    ]
+    required_params = []
+    if params['Flood_File'] or params['OutDEP'] or params['OutWSE'] or params['OutVEL'] or (params['BathyOutputFileName'] and params['BathyFromARFileName'] and not path_exists(params['BathyWaterMaskFileName'])):
+        required_params.append('FlowFileName')
+
     if params['mapper'] == "Curve2Flood-FLDPLNpy":
         required_params.extend([
             'Flow_Direction_File',
@@ -1299,49 +1310,18 @@ def validate_params(params: dict):
     if missing_params:
         raise ValueError(f"Missing required parameters: {', '.join(missing_params)}")
 
-def Curve2Flood_MainFunction(input_file: str = None,
-                             args: dict = None, 
-                             quiet: bool = False,
-                             flood_vdt_cells: bool = True,
-                             bathymetry_creation_options: list[str] = None,
-                             **kwargs):
-
-    """
-    Main function that takes runs the flood mapping. If an input file is provided, it reads the parameters from the file.
-    If no input file is provided, it uses the parameters from the args dictionary. The args dictionary should contain Python objects
-    that can be converted to strings.
-
-    Parameters:
-    ----------
-    input_file : str
-        Path to the input file containing parameters.
-    args : dict
-        Dictionary of parameters.
-    quiet : bool
-        If True, suppresses warning messages and progress bars.
-    flood_vdt_cells : bool
-        If True, includes VDT cells in the flood map.
-    bathymetry_creation_options : list[str]
-        List of options for bathymetry raster creation.
-    **kwargs
-        Additional keyword arguments, for backwards compatibility with older versions of the function that may have used different parameter names.
-
-    """
-    params = get_params(input_file, args)
-    validate_params(params)
-    
-    LOG.info('Opening ' + params['DEM_File'])
-    ds: gdal.Dataset = gdal.Open(params['DEM_File'])
-    dem_geotransform = ds.GetGeoTransform()
-    dem_projection = ds.GetProjection()
-    nrows = ds.RasterYSize
-    ncols = ds.RasterXSize
-    yll = dem_geotransform[3] - nrows * abs(dem_geotransform[5])
-    yur = dem_geotransform[3]
-    
-    E = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)  #Create an array that is slightly larger than the STRM Raster Array and fill it with -9999.0
-    E[1:-1, 1:-1] = ds.ReadAsArray()
-    ds = None  
+def main_flood_ouputs(
+        params: dict, 
+        E: np.ndarray, 
+        WeightBox: np.ndarray, 
+        TW_for_WeightBox_ElipseMask: int, 
+        dx: float, 
+        dy: float, 
+        dem_projection: str,
+        dem_geotransform: tuple,
+        quiet: bool = False, 
+        flood_vdt_cells: bool = False):
+    nrows, ncols = E[1:-1, 1:-1].shape
 
     if params['mapper'] == "Curve2Flood-FLDPLNpy":
         FlowDir = gdal.Open(params['Flow_Direction_File']).ReadAsArray().astype(np.uint8, copy=False)
@@ -1379,7 +1359,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
 
     #Get the Stream Locations from the Curve or VDT File
     if params['Set_Depth'] > 0.0:
-        (S, ncols, nrows, cellsize, yll, yur, xll, xur, lat, dem_geotransform, dem_projection) = Read_Raster_GDAL(params['STRM_File'])
+        (S, ncols, nrows, cellsize, yll, yur, xll, xur, lat, __loader__, _) = Read_Raster_GDAL(params['STRM_File'])
     elif params['VDTDatabaseFileName']:
         S = Set_Stream_Locations(nrows, ncols, params['VDTDatabaseFileName'])
     elif params['CurveParamFileName']:
@@ -1418,14 +1398,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
             LOG.error(f'{raster_name} raster CRS units are not meters or degrees: {", ".join(invalid_units)}')
             return
     
-    #Get Cellsize Information directly from DEM geotransform.
-    #Supports rotated grids by using vector magnitude for each pixel axis.
-    dem_cell_size_x = np.hypot(dem_geotransform[1], dem_geotransform[2])
-    dem_cell_size_y = np.hypot(dem_geotransform[4], dem_geotransform[5])
-    dx, dy, dproject = convert_cell_size(dem_cell_size_x, dem_cell_size_y, yll, yur, dem_projection)
-    LOG.info('Cellsize X = ' + str(dx))
-    LOG.info('Cellsize Y = ' + str(dy))
-    
     #Get list of Unique Stream IDs.  Also find where all the cell values are.
     B = np.zeros((nrows+2,ncols+2), dtype=np.int32)  #Create an array that is slightly larger than the STRM Raster Array
     B[1:-1, 1:-1] = S
@@ -1439,14 +1411,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
     LOG.info('Opening and Reading ' + params['FlowFileName'])
     num_flows = pd.read_csv(params['FlowFileName'], nrows=0).shape[1] - 1  #Subtract 1 for the COMID Column
     LOG.info('Evaluating ' + str(num_flows) + ' Flow Events')
-    
-    #Creating the initial Weight Box
-    LOG.info('Creating the Weight Box')
-    TW_for_WeightBox_ElipseMask = int( max( np.round(params['TopWidthPlausibleLimit']/dx,0), np.round(params['TopWidthPlausibleLimit']/dy,0) ) )  #This is how many cells we will be looking at surrounding our stream cell
-    if params['mapper'] == "Curve2Flood-FLDPLNpy":
-        WeightBox = None
-    else:
-        WeightBox = create_weightbox(TW_for_WeightBox_ElipseMask, dx, dy)
 
     #If you're setting a set-depth value for all streams, just need to simulate one flood event
     if params['Set_Depth'] >= 0.0:
@@ -1600,7 +1564,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
         # Create the velocity output raster
         create_velocity(params, OutVEL, Depth_Array, LC_array, Slope_array_list, dem_geotransform, dem_projection, ncols, nrows, Flood_Ensemble)
 
-
     if params['StrmShp_File'] and params['Make_Output_GPKG'] and Flood_File:
         # convert the raster to a geodataframe
         flood_gdf = Write_Output_Raster_As_GeoDataFrame(Flood_Ensemble, ncols, nrows, dem_geotransform, dem_projection, gdal.GDT_Byte)
@@ -1610,6 +1573,76 @@ def Curve2Flood_MainFunction(input_file: str = None,
 
         # save the geodataframe (do not specify the driver, it will be inferred from the file extension)
         flood_gdf.to_file(shp_output_filename)
+
+    return Flood_Ensemble
+
+def path_exists(path: str | os.PathLike) -> bool:
+    """Check if a given path exists."""
+    return path and Path(path).exists()
+
+def Curve2Flood_MainFunction(input_file: str = None,
+                             args: dict = None, 
+                             quiet: bool = False,
+                             flood_vdt_cells: bool = True,
+                             bathymetry_creation_options: list[str] = None,
+                             **kwargs):
+
+    """
+    Main function that takes runs the flood mapping. If an input file is provided, it reads the parameters from the file.
+    If no input file is provided, it uses the parameters from the args dictionary. The args dictionary should contain Python objects
+    that can be converted to strings.
+
+    Parameters:
+    ----------
+    input_file : str
+        Path to the input file containing parameters.
+    args : dict
+        Dictionary of parameters.
+    quiet : bool
+        If True, suppresses warning messages and progress bars.
+    flood_vdt_cells : bool
+        If True, includes VDT cells in the flood map.
+    bathymetry_creation_options : list[str]
+        List of options for bathymetry raster creation.
+    **kwargs
+        Additional keyword arguments, for backwards compatibility with older versions of the function that may have used different parameter names.
+
+    """
+    params = get_params(input_file, args)
+    validate_params(params)
+
+    LOG.info('Opening ' + params['DEM_File'])
+    ds: gdal.Dataset = gdal.Open(params['DEM_File'])
+    dem_geotransform = ds.GetGeoTransform()
+    dem_projection = ds.GetProjection()
+    nrows = ds.RasterYSize
+    ncols = ds.RasterXSize
+    yll = dem_geotransform[3] - nrows * abs(dem_geotransform[5])
+    yur = dem_geotransform[3]
+    
+    E = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)  #Create an array that is slightly larger than the STRM Raster Array and fill it with -9999.0
+    E[1:-1, 1:-1] = ds.ReadAsArray()
+    ds = None  
+
+    #Get Cellsize Information directly from DEM geotransform.
+    #Supports rotated grids by using vector magnitude for each pixel axis.
+    dem_cell_size_x = np.hypot(dem_geotransform[1], dem_geotransform[2])
+    dem_cell_size_y = np.hypot(dem_geotransform[4], dem_geotransform[5])
+    dx, dy, dproject = convert_cell_size(dem_cell_size_x, dem_cell_size_y, yll, yur, dem_projection)
+    LOG.info('Cellsize X = ' + str(dx))
+    LOG.info('Cellsize Y = ' + str(dy))
+
+    #Creating the initial Weight Box
+    LOG.info('Creating the Weight Box')
+    TW_for_WeightBox_ElipseMask = int( max( np.round(params['TopWidthPlausibleLimit']/dx,0), np.round(params['TopWidthPlausibleLimit']/dy,0) ) )  #This is how many cells we will be looking at surrounding our stream cell
+    if params['mapper'] == "Curve2Flood-FLDPLNpy":
+        WeightBox = None
+    else:
+        WeightBox = create_weightbox(TW_for_WeightBox_ElipseMask, dx, dy)
+
+    Flood_Ensemble = None
+    if params['Flood_File'] or params['OutDEP'] or params['OutWSE'] or params['OutVEL'] or (params['BathyOutputFileName'] and params['BathyFromARFileName'] and not path_exists(params['BathyWaterMaskFileName'])):
+        Flood_Ensemble = main_flood_ouputs(params, E, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy, dem_projection, dem_geotransform, quiet=quiet, flood_vdt_cells=flood_vdt_cells)
 
     if params['BathyFromARFileName'] and params['BathyOutputFileName']:
         create_bathymetry(params, E, nrows, ncols, dem_geotransform, dem_projection, 

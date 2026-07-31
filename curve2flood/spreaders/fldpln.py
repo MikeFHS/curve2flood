@@ -295,7 +295,7 @@ def _spill_candidates(boundary: list[tuple[int, int, float]], records: dict[int,
 @njit(cache=True, nogil=True)
 def _forward_path(start: int, spill_dtf: float, fil: np.ndarray, fdr: np.ndarray,
                   flddat: np.ndarray, nrows: int, ncols: int, bg: float,
-                  excluded: set[int]) -> list[int]:
+                  excluded: set[int], spill_decay: float) -> list[int]:
     path: list[int] = []
     seen: set[int] = set()
     current = start
@@ -315,6 +315,7 @@ def _forward_path(start: int, spill_dtf: float, fil: np.ndarray, fdr: np.ndarray
         if flddat[nxt] > 0 and spill_dtf >= flddat[nxt]:
             break
         current = nxt
+        spill_dtf += spill_decay
     return path
 
 @njit(cache=True, nogil=True)
@@ -341,7 +342,8 @@ def _fldpln_library_for_segment(shape: tuple[int, int],
                                fldmx: float,
                                iterative_spill: bool,
                                global_max_wse: float = 0.0,
-                               bg: float = -9999) -> pd.DataFrame:
+                               bg: float = -9999,
+                               spill_decay: float = 0.0) -> pd.DataFrame:
     """
     Build an FLDPLN floodplain table for a stream segment.
     """
@@ -400,7 +402,7 @@ def _fldpln_library_for_segment(shape: tuple[int, int],
             new_spill_boundary.clear()
 
             for fsp, spill_dtf, pixel, pixel_elev, _ in candidates:
-                path = _forward_path(pixel, spill_dtf, filled_dem, flow_direction, flood_depths, nrows, ncols, bg, excluded)
+                path = _forward_path(pixel, spill_dtf, filled_dem, flow_direction, flood_depths, nrows, ncols, bg, excluded, spill_decay)
                 if not path:
                     continue
                 path_set = set(path)
@@ -441,7 +443,7 @@ def _fldpln_library_for_segment(shape: tuple[int, int],
     rows: list[list[float]] = []
     for pixel, (fsp, dtf) in records.items():
         out_dtf = max(fldmn, dtf)
-        sink_fill_depth = filled_dem[pixel] - max(0.0, dem[pixel])
+        sink_fill_depth = filled_dem[pixel] - dem[pixel]
         rows.append([fsp, pixel, out_dtf, sink_fill_depth])
 
     return rows
@@ -456,7 +458,8 @@ def fldpln_library_for_segment(dem: np.ndarray,
                                fldmx: float,
                                iterative_spill: bool,
                                global_max_wse: float = 0.0,
-                               bg: float = -9999):
+                               bg: float = -9999,
+                               spill_decay: float = 0.0) -> pd.DataFrame:
     """Build an FLDPLN floodplain table for a single stream segment.
 
     Parameters
@@ -483,7 +486,8 @@ def fldpln_library_for_segment(dem: np.ndarray,
         Upper bound on water-surface elevation. 0 means no bound. 
     bg : float, optional
         Background/no-data value in DEM.
-
+    spill_decay : float, optional
+        When spilling, the amount to increase the DTF for each downstream pixel. This throttles spilling.
     Returns
     -------
     pandas.DataFrame
@@ -505,7 +509,7 @@ def fldpln_library_for_segment(dem: np.ndarray,
     global_max_wse = np.finfo(np.float32).max if not global_max_wse else 0.99999 * global_max_wse
 
     rows = _fldpln_library_for_segment(
-        (np.int32(nrows), np.int32(ncols)), dem, filled_dem, flow_direction, stream_id, stream_info, dh, fldmn, fldmx, iterative_spill, global_max_wse, bg
+        (np.int32(nrows), np.int32(ncols)), dem, filled_dem, flow_direction, stream_id, stream_info, dh, fldmn, fldmx, iterative_spill, global_max_wse, bg, spill_decay
     )
     header = [
         "FSP",
@@ -880,6 +884,30 @@ def limit_rise(arr, max_rise=0.5):
 
     return out
 
+def fill_missing_profile(x: np.ndarray,
+                         valid: np.ndarray,
+                         values: np.ndarray,
+                         method: str = "ffill") -> np.ndarray:
+    if method == "none":
+        out = np.full(len(x), np.nan, dtype=float)
+        out[valid] = values
+        return out
+
+    if method == "nearest":
+        valid_x = x[valid]
+        idx = np.searchsorted(valid_x, x, side="left")
+        idx = np.clip(idx, 0, len(valid_x) - 1)
+        left = np.clip(idx - 1, 0, len(valid_x) - 1)
+        use_left = np.abs(x - valid_x[left]) <= np.abs(x - valid_x[idx])
+        return values[np.where(use_left, left, idx)]
+
+    if method == "linear":
+        return np.interp(x, x[valid], values)
+
+    out = np.full(len(x), np.nan, dtype=float)
+    out[valid] = values
+    return pd.Series(out).ffill().bfill().to_numpy(dtype=float)
+
 def longest_path_decomposition(G: nx.DiGraph, stream_wse_dict: dict[int, list[tuple[int, float]]]) -> list[list[int]]:
     """
     Decompose a DAG into disjoint longest headwater->outlet paths.
@@ -932,8 +960,22 @@ def make_flood_map(
         stream_info_df: pd.DataFrame,
         stream_gdf: gpd.GeoDataFrame,
         max_wse_rise: float = 0.01,
-        percentile: float = 30.0):
+        median_filter_size: int = 53,
+        dof_scale: float = 1.55,
+        dof_offset: float = -0.1,
+        missing_fsp_interpolation: str = "ffill",
+        dof_signal: str = "min",
+        threshold_mode: str = "normal"):
     nrows, ncols = filled_dem.shape
+    median_filter_size = int(median_filter_size)
+    if median_filter_size < 1:
+        median_filter_size = 1
+    if median_filter_size % 2 == 0:
+        median_filter_size += 1
+    dof_scale = max(float(dof_scale), 0.0)
+    dof_offset = float(dof_offset)
+    dof_signal = str(dof_signal).lower()
+    threshold_mode = str(threshold_mode).lower()
 
     vdt_df = vdt_df.with_columns(FSP=(pl.col('Row') * ncols + pl.col('Col')).cast(pl.Int32))
     fsp_wse_dict = dict(zip(vdt_df['FSP'], vdt_df['WSE']))
@@ -980,71 +1022,66 @@ def make_flood_map(
     row_chunks = []
     for path in paths:
         path_rows = []
-        averages = []
         for stream_id in path:
             path_rows.extend(stream_rows[stream_id])
-            # Compute average water depth for the stream segment
-            stream_rows_data = stream_rows[stream_id]
-            if len(stream_rows_data) == 0:
-                continue
-
-            if all(np.isnan(wse) for _, wse in stream_rows_data):
-                continue
-            
-            average_depth = np.nanpercentile([wse - dem[_pixel_to_rc(fsp, ncols)] for fsp, wse in stream_rows_data], percentile)
-            averages.extend([average_depth + dem[_pixel_to_rc(pixel, ncols)] for pixel, _ in stream_rows_data])
     
         if not path_rows:
             continue
 
-        averages = limit_rise(averages, max_rise=max_wse_rise)
-
-        import matplotlib.pyplot as plt
         X = np.arange(len(path_rows))
         Y = np.array([wse for _, wse in path_rows])
         from scipy.ndimage import median_filter
         mask = ~np.isnan(Y)
         if mask.sum() == 0:
             continue
-        wse_smoothed = median_filter(Y[mask], size=50)
-        # Interpolate smoothed values over nans
+        wse_smoothed = median_filter(Y[mask], size=median_filter_size)
         wse_limited = limit_rise(wse_smoothed, max_rise=max_wse_rise)
-        wse_interped = np.interp(X, X[mask], wse_limited)
-        # Limit upward rises in the smoothed values
+        wse_interped = fill_missing_profile(X, mask, wse_limited, missing_fsp_interpolation)
 
         depths = np.array([
             wse - dem[_pixel_to_rc(pixel, ncols)]
             for pixel, wse in path_rows
         ])
-        depths_smoothed = median_filter(depths[mask], size=50)
-        # depths_limited = limit_rise(depths_smoothed, max_rise=max_wse_rise)
-        depths_interped = np.interp(X, X[mask], depths_smoothed)
-        # make wse interped the min of elev + depth and wse_interped
-        wse_interped = np.minimum(wse_interped, depths_interped + np.array([dem[_pixel_to_rc(pixel, ncols)] for pixel, _ in path_rows]))
-        wse_from_depths = np.fmin(depths_interped + np.array([dem[_pixel_to_rc(pixel, ncols)] for pixel, _ in path_rows]), Y)
+        depths_smoothed = median_filter(depths[mask], size=median_filter_size)
+        depths_interped = fill_missing_profile(X, mask, depths_smoothed, missing_fsp_interpolation)
 
-        
-        # plt.figure(figsize=(12, 6))
-        # plt.plot(X, Y, label='Original WSE', color='blue')
-        # plt.plot(X, [dem[_pixel_to_rc(fsp, ncols)] for fsp in [fsp for fsp, _ in path_rows]], label='DEM Elevation', color='green')
-        # plt.plot(X, averages, label='Average Depth + Elevation', color='purple', linestyle=':')
-        # plt.plot(X, wse_interped, label='Smoothed and Limited WSE', color='red', linestyle='--')
-        # plt.plot(X, wse_from_depths, label='Smoothed and Limited Depth + Elevation', color='orange', linestyle='-.')
-        # plt.title(f'Stream Path WSE Smoothing and Limiting')
-        # plt.xlabel('Pixel Index along Stream Path')
-        # plt.ylabel('Water Surface Elevation (WSE)')
-        # plt.legend()
-        # plt.grid()
-        # plt.show()
+        dem_profile = np.array([dem[_pixel_to_rc(pixel, ncols)] for pixel, _ in path_rows])
+        wse_dof = wse_interped - dem_profile
+        if dof_signal == "wse":
+            dof_profile = wse_dof
+        elif dof_signal == "depth":
+            dof_profile = depths_interped
+        elif dof_signal == "max":
+            dof_profile = np.maximum(wse_dof, depths_interped)
+        elif dof_signal == "blend":
+            dof_profile = 0.5 * wse_dof + 0.5 * depths_interped
+        else:
+            dof_profile = np.minimum(wse_dof, depths_interped)
+        dof_profile = np.maximum(dof_profile * dof_scale + dof_offset, 0.0)
 
-        row_chunks.extend([(fsp, wse - dem[_pixel_to_rc(fsp, ncols)]) for (fsp, _), wse in zip(path_rows, wse_interped)])
-    # exit()
+        row_chunks.extend([
+            (fsp, dof)
+            for (fsp, _), dof in zip(path_rows, dof_profile)
+            if np.isfinite(dof) and dof > 0.0
+        ])
+
+    if not row_chunks:
+        return wse_array
+
     df = pl.LazyFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32}, orient='row')
 
     # merge the two dataframes on the row and column indices
     fldpln_library = fldpln_library.join(df, on='FSP', how='inner')
+    if threshold_mode == "subtract_fill":
+        threshold_expr = (pl.col('DTF') - pl.col('fill depth')).clip(0.0)
+    elif threshold_mode == "half_subtract_fill":
+        threshold_expr = (pl.col('DTF') - 0.5 * pl.col('fill depth')).clip(0.0)
+    elif threshold_mode == "add_fill":
+        threshold_expr = pl.col('DTF') + pl.col('fill depth')
+    else:
+        threshold_expr = pl.col('DTF')
     fldpln_library = fldpln_library.with_columns(
-        DTF=(pl.col('DoF') - pl.col('DTF'))
+        DTF=(pl.col('DoF') - threshold_expr)
     )
     fldpln_library = fldpln_library.filter(pl.col('DTF') > 0)
     fldpln_library = fldpln_library.group_by('FPP').agg([
