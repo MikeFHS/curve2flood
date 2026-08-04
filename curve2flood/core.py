@@ -788,10 +788,16 @@ def Create_Topobathy_Dataset(
 
     E, Bathy, ARBathyMask are all (nrows+2, ncols+2).
     """
-    # 1) Spread Bathy values using the WeightBox kernel, accumulating weighted sums and total weights
+    # ------------------------------------------------------------
+    # 1) PRE-CLEANUP: Outside ARBathyMask, Bathy = DEM BEFORE weighting
+    # ------------------------------------------------------------
+    mask = (Bathy < -98.99) & (ARBathyMask == 0)
+    Bathy[mask] = E[mask]
+
+    # 2) Spread Bathy values using the WeightBox kernel, accumulating weighted sums and total weights
     bathy_times_weight, total_weight = spread_Bathy(nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, Bathy, ARBathyMask)
 
-    # 2) Start from original Bathy, and fill only where Bathy was invalid
+    # 3) Start from original Bathy, and fill only where Bathy was invalid
     invalid = (Bathy <= -98.99) | np.isnan(Bathy)
 
     use_weight = invalid & (total_weight > 1e-10)
@@ -800,19 +806,19 @@ def Create_Topobathy_Dataset(
     Bathy[use_weight] = bathy_times_weight[use_weight] / total_weight[use_weight]
     Bathy[use_dem] = E[use_dem]
 
-    # 3) Optional extra smoothing (you can keep or weaken this)
+    # 4) Optional extra smoothing (you can keep or weaken this)
     # We smooth using a fun math trick, only within the AR bathy mask, to avoid smoothing the banks in!
-    uniform_smoothing(ARBathyMask, Bathy)
+    # uniform_smoothing(ARBathyMask, Bathy)
 
-    # 4) Outside the AR bathy mask, always use DEM
+    # 5) Outside the AR bathy mask, always use DEM
     mask = ARBathyMask != 1
     Bathy[mask] = E[mask]
 
-    # 5) Final safety net: any remaining bad values from DEM
-    mask = (Bathy <= -98.99) | (Bathy < -9998.0) | np.isnan(Bathy)
+    # 6) Final safety net: any remaining bad values from DEM
+    mask = (Bathy <= -98.99) | np.isnan(Bathy)
     Bathy[mask] = E[mask]
     
-    # 6) Honor Bathy_Use_Banks: keep bathy from being above DEM if requested
+    # 7) Honor Bathy_Use_Banks: keep bathy from being above DEM if requested
     if not Bathy_Use_Banks:
         np.minimum(Bathy, E, out=Bathy)
 
