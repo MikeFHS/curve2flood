@@ -1,3 +1,3 @@
-from .fldpln import make_flood_map, build_fldpln_library
+from .fldpln import _make_fldpln_flood_map, build_fldpln_library
 from .kernel_weighted import create_kernel_weighted_spread_map
 from .multi_point import filter_outliers, compute_tw_multfact_scale, multi_point_interpolation

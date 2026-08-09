@@ -23,7 +23,7 @@ from scipy.ndimage import label, generate_binary_structure, distance_transform_e
 
 from curve2flood import LOG
 from curve2flood.spreaders import (
-    make_flood_map, create_kernel_weighted_spread_map, filter_outliers, compute_tw_multfact_scale, multi_point_interpolation
+    _make_fldpln_flood_map, create_kernel_weighted_spread_map, filter_outliers, compute_tw_multfact_scale, multi_point_interpolation
 )
 
 gdal.UseExceptions()
@@ -203,8 +203,7 @@ def FindFlowRateForEachCOMID_Ensemble(FlowFileName: str, flow_event_num: int) ->
 
     return comid_q_dict
 
-def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Unique_Flow: dict, COMID_Unique, T_Rast, W_Rast, S_Rast, TW_MultFact, dx=None, dy=None):
-
+def calculate_interpolated_curvefile(CurveParamFileName: str, COMID_Unique_Flow: dict, TW_MultFact: float) -> pd.DataFrame:
     LOG.debug('\nOpening and Reading ' + CurveParamFileName)
 
     # read the curve data in as a Pandas dataframe
@@ -240,6 +239,11 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
 
     curve_df['TopWidth'] = curve_df['TopWidth'].astype(np.float32) * (TW_MultFact * tw_scale)
 
+    return curve_df
+
+def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Unique_Flow: dict, COMID_Unique, T_Rast, W_Rast, S_Rast, TW_MultFact, dx=None, dy=None):
+    curve_df = calculate_interpolated_curvefile(CurveParamFileName, COMID_Unique_Flow, TW_MultFact)
+
     # Fill in the T_Rast and W_Rast
     T_Rast[curve_df['Row'], curve_df['Col']] = curve_df['TopWidth']
     W_Rast[curve_df['Row'], curve_df['Col']] = curve_df['Depth'] + curve_df['BaseElev']
@@ -255,8 +259,6 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
         'Row''first',
         'Col''first'
     })
-
-    wse_stats = curve_df.groupby('COMID')['WSE'].agg(['mean', 'std'])
     
     # Map results back to the unique COMID list
     comid_result_df = pd.DataFrame({'COMID': COMID_Unique})
@@ -879,14 +881,23 @@ def make_fldpln_flood_map(
         fldpln_library,
         streams_gdf,
         ):
-    vdt_df = calculate_interpolated_vdt(
-        params['VDTDatabaseFileName'],
-        COMID_Unique_Flow,
-        E,
-        params['TW_MultFact']
-    )
+    if params['VDTDatabaseFileName']:
+        vdt_df = calculate_interpolated_vdt(
+            params['VDTDatabaseFileName'],
+            COMID_Unique_Flow,
+            E,
+            params['TW_MultFact']
+        )
+    elif params['CurveParamFileName']:  
+        curve_df = calculate_interpolated_curvefile(
+            params['CurveParamFileName'],
+            COMID_Unique_Flow,
+            params['TW_MultFact']
+        )
+    else:
+        raise ValueError("Either VDTDatabaseFileName or CurveParamFileName must be provided in params.")
 
-    wse_array = make_flood_map(
+    wse_array = _make_fldpln_flood_map(
         E[1:-1, 1:-1],
         filled_dem,
         vdt_df,
@@ -1641,7 +1652,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
     #Creating the initial Weight Box
     LOG.info('Creating the Weight Box')
     TW_for_WeightBox_ElipseMask = int( max( np.round(params['TopWidthPlausibleLimit']/dx,0), np.round(params['TopWidthPlausibleLimit']/dy,0) ) )  #This is how many cells we will be looking at surrounding our stream cell
-    if params['mapper'] == "Curve2Flood-FLDPLNpy":
+    if params['mapper'] == "Curve2Flood-FLDPLNpy" and not (params['BathyFromARFileName'] and params['BathyOutputFileName']):
         WeightBox = None
     else:
         WeightBox = create_weightbox(TW_for_WeightBox_ElipseMask, dx, dy)

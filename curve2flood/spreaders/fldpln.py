@@ -951,7 +951,7 @@ def longest_path_decomposition(G: nx.DiGraph, stream_wse_dict: dict[int, list[tu
 
     return paths
 
-def make_flood_map(
+def _make_fldpln_flood_map(
         dem: np.ndarray,
         filled_dem: np.ndarray,
         vdt_df: pl.DataFrame,
