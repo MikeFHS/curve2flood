@@ -990,11 +990,12 @@ def _make_fldpln_flood_map(
 
     stream_gdf = stream_gdf.sort_values('topological_order')
     G = nx.from_pandas_edgelist(
-        stream_gdf[stream_gdf['DSLINKNO'] > 0],
+        stream_gdf,
         source='LINKNO',
         target='DSLINKNO',
         create_using=nx.DiGraph
     )
+    G.remove_node(-1)  # Remove the dummy downstream node
 
     fdr = fdr.ravel()
     stream_rows: dict[list[tuple]] = defaultdict(list)

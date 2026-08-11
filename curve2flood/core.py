@@ -353,13 +353,12 @@ def interp1d_numba(x: np.ndarray, y: np.ndarray, xi: float | int) -> float:
 
     return y0 + (xi - x0) * (y1 - y0) / (x1 - x0) if (x1 - x0) != 0 else y0
 
-@njit("Tuple((float32[:], float32[:], float32[:], float32[:]))(float32[:], float32[:], float32[:,:], float32[:, :], float32[:], float32[:, :], float32[:, :], float32[:], float32[:])",
-      cache=True)
+# @njit("Tuple((float32[:], float32[:], float32[:], float32[:]))(float32[:], float32[:], float32[:,:], float32[:, :], float32[:, :], float32[:, :], float32[:], float32[:])",
+#       cache=True)
 def vdt_interpolate(flow: np.ndarray,
                     qb: np.ndarray, 
                     flow_values: np.ndarray, 
                     top_width_values: np.ndarray,
-                    elev_values: np.ndarray,
                     wse_values: np.ndarray,
                     vel_values: np.ndarray,
                     e_dem: np.ndarray,
@@ -372,13 +371,7 @@ def vdt_interpolate(flow: np.ndarray,
 
     # Loop through each row in the DataFrame, interpolate as needed
     for i in range(len(flow)):
-        if flow[i] <= qb[i]:
-            # Below baseflow
-            top_width[i] = Find_TopWidth_at_Baseflow_when_using_VDT(qb[i], flow_values[i], top_width_values[i])
-            depth[i] = 0.001
-            wse[i] = elev_values[i]
-            vel[i] = vel_values[i][-1]
-        elif flow[i] >= flow_values[i][-1]:
+        if flow[i] >= flow_values[i][-1]:
             # Above the maximum flow value
             top_width[i] = top_width_values[i][-1]
             wse[i] = wse_values[i][-1]
@@ -387,10 +380,10 @@ def vdt_interpolate(flow: np.ndarray,
         else:
             # Interpolate
             wse[i] = interp1d_numba(flow_values[i], wse_values[i], flow[i])
-            top_width[i] = interp1d_numba(flow_values[i], top_width_values[i], flow[i])
+            top_width[i] = max(interp1d_numba(flow_values[i], top_width_values[i], flow[i]), 0.0)
             wse[i] = max(wse[i], e_dem[i])
             depth[i] = max(wse[i] - e_dem[i], 0.001)
-            vel[i] = interp1d_numba(flow_values[i], vel_values[i], flow[i])
+            vel[i] = max(interp1d_numba(flow_values[i], vel_values[i], flow[i]), 0.0)
 
         baseflow_tw[i] = Find_TopWidth_at_Baseflow_when_using_VDT(qb[i], flow_values[i], top_width_values[i])
 
@@ -436,11 +429,10 @@ def calculate_interpolated_vdt(
     top_width_values = vdt_df.select(cs.starts_with('t_')).to_numpy().astype(np.float32, copy=False)
     wse_values = vdt_df.select(cs.starts_with('wse_')).to_numpy().astype(np.float32, copy=False)
     vel_values = vdt_df.select(cs.starts_with('v_')).to_numpy().astype(np.float32, copy=False)
-    elev_values = vdt_df['Elev'].to_numpy().astype(np.float32, copy=False)
 
     tw_scale = compute_tw_multfact_scale(flow, qb)
     tw_mult_fact = (TW_MultFact * tw_scale).astype(np.float32)
-    top_width, depth, wse, velocity = vdt_interpolate(flow, qb, flow_values, top_width_values, elev_values, wse_values, vel_values, e_dem, tw_mult_fact)
+    top_width, depth, wse, velocity = vdt_interpolate(flow, qb, flow_values, top_width_values, wse_values, vel_values, e_dem, tw_mult_fact)
 
     # Add the interpolated values back to the DataFrame
     vdt_df = vdt_df.with_columns([
