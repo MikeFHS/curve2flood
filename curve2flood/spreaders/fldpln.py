@@ -820,7 +820,7 @@ def make_dtf_map(filled_dem_file: str, fldpln_library_file: str, output_file: st
     else:
         df = pd.read_csv(fldpln_library_file)
 
-    df = df.groupby('FPP', as_index=False).agg({'DTF': 'mean'})
+    df = df.groupby('FPP', as_index=False).agg({'DTF': 'min'})
     df['Row'] = (df['FPP'] // ncols).astype(int)
     df['Col'] = (df['FPP'] % ncols).astype(int)
     df['DTF'] = df['DTF'].clip(lower=0)
@@ -1039,14 +1039,14 @@ def _make_fldpln_flood_map(
         wse_interped = fill_missing_profile(X, mask, wse_limited, missing_fsp_interpolation)
 
         depths = np.array([
-            wse - dem[_pixel_to_rc(pixel, ncols)]
+            wse - filled_dem[_pixel_to_rc(pixel, ncols)]
             for pixel, wse in path_rows
         ])
         depths_smoothed = median_filter(depths[mask], size=median_filter_size)
         depths_interped = fill_missing_profile(X, mask, depths_smoothed, missing_fsp_interpolation)
 
-        dem_profile = np.array([dem[_pixel_to_rc(pixel, ncols)] for pixel, _ in path_rows])
-        wse_dof = wse_interped - dem_profile
+        filled_dem_profile = np.array([filled_dem[_pixel_to_rc(pixel, ncols)] for pixel, _ in path_rows])
+        wse_dof = wse_interped - filled_dem_profile
         if dof_signal == "wse":
             dof_profile = wse_dof
         elif dof_signal == "depth":
@@ -1057,7 +1057,6 @@ def _make_fldpln_flood_map(
             dof_profile = 0.5 * wse_dof + 0.5 * depths_interped
         else:
             dof_profile = np.minimum(wse_dof, depths_interped)
-        dof_profile = np.maximum(dof_profile * dof_scale + dof_offset, 0.0)
 
         row_chunks.extend([
             (fsp, dof)
@@ -1072,18 +1071,10 @@ def _make_fldpln_flood_map(
 
     # merge the two dataframes on the row and column indices
     fldpln_library = fldpln_library.join(df, on='FSP', how='inner')
-    if threshold_mode == "subtract_fill":
-        threshold_expr = (pl.col('DTF') - pl.col('fill depth')).clip(0.0)
-    elif threshold_mode == "half_subtract_fill":
-        threshold_expr = (pl.col('DTF') - 0.5 * pl.col('fill depth')).clip(0.0)
-    elif threshold_mode == "add_fill":
-        threshold_expr = pl.col('DTF') + pl.col('fill depth')
-    else:
-        threshold_expr = pl.col('DTF')
     fldpln_library = fldpln_library.with_columns(
-        DTF=(pl.col('DoF') - threshold_expr)
+        DTF=(pl.col('DoF') - pl.col('DTF'))
     )
-    fldpln_library = fldpln_library.filter(pl.col('DTF') > 0)
+    # Do NOT filter DTF < 0, because DTF is refering to the filled DEM, not the og DEM. So negative depths are allowed.
     fldpln_library = fldpln_library.group_by('FPP').agg([
         pl.max('DTF'),
         pl.first('fill depth')
