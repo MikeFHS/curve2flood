@@ -614,6 +614,7 @@ def build_fldpln_library(
     fldmx: float,
     iterative_spill: bool,
     vdt_file: str = None,
+    bg_mask: np.ndarray | None = None,
     stream_ids: list[int] | None = None,
     global_max_wse: float = 0.0,
     bg: float = -9999,
@@ -644,6 +645,8 @@ def build_fldpln_library(
         Whether to use iterative spill routing when generating outputs. Recommended if the DEM is high resolution (<= 10 m)
     vdt_file: str | None
         Optional VDT file used to derive per-stream maximum depths.
+    bg_mask: np.ndarray | None
+        Optional background mask to exclude certain pixels from flooding.
     stream_ids: list[int] | None
         Optional subset of COMIDs to process.
     global_max_wse: float
@@ -661,7 +664,7 @@ def build_fldpln_library(
         _build_fldpln_library(
             dem, filled_dem, stream_info_file, flow_direction_file, library_file,
             dh, fldmn, fldmx, iterative_spill, vdt_file, stream_ids,
-            global_max_wse, bg, parallel, pbar, processes
+            global_max_wse, bg, parallel, pbar, processes, bg_mask
         )
     finally:
         close_shared_memory(['dem_array', 'filled_dem_array', 'flow_direction_array'])
@@ -682,7 +685,8 @@ def _build_fldpln_library(
     bg: float = -9999,
     parallel: bool = False,
     pbar: bool = True,
-    processes: int | None = None
+    processes: int | None = None,
+    bg_mask: np.ndarray | None = None
 ):
     """
     Build floodplain library.
@@ -733,6 +737,9 @@ def _build_fldpln_library(
     dem_array = read_array_and_set_shared(dem, np.float32, set_shared=parallel, name='dem_array')
     filled_dem_array = read_array_and_set_shared(filled_dem, np.float32, set_shared=parallel, name='filled_dem_array')
     flow_direction_array = read_array_and_set_shared(flow_direction_file, np.uint8, set_shared=parallel, name='flow_direction_array')
+
+    if bg_mask is not None:
+        filled_dem_array[bg_mask] = bg
 
     stream_ids = stream_info.iloc[:, 3].unique()
     if vdt_file is None:
