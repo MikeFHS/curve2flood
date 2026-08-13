@@ -766,6 +766,7 @@ def uniform_smoothing(mask: np.ndarray, values: np.ndarray):
     count = uniform_filter(mask.astype(np.float32, copy=False), size=window_size, mode='nearest') * window_size
     np.divide(value_sum, count, out=values, where=count > 0)
 
+
 def Create_Topobathy_Dataset(
     E: np.ndarray,
     nrows: int,
@@ -1210,7 +1211,7 @@ def get_params(input_file: str = None, args: dict = None):
         with open(input_file,'r') as infile:
             if input_file.lower().endswith(('.yaml', '.yml')):
                 # If it's a YAML file, parse it with PyYAML and convert to the expected list of lines format
-                data = yaml.safe_load(infile)
+                data = yaml.load(infile, Loader=yaml.CSafeLoader)
             else:
                 data = {}
                 for line in infile.readlines():
