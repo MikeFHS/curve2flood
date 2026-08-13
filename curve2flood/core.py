@@ -900,11 +900,8 @@ def make_fldpln_flood_map(
         streams_gdf,
         max_wse_rise=params['max_wse_rise'],
         median_filter_size=params['FLDPLN_Median_Filter_Size'],
-        dof_scale=params['FLDPLN_DoF_Scale'],
-        dof_offset=params['FLDPLN_DoF_Offset'],
         missing_fsp_interpolation=params['FLDPLN_Missing_FSP_Interpolation'],
         dof_signal=params['FLDPLN_DoF_Signal'],
-        threshold_mode=params['FLDPLN_Threshold_Mode'],
     )
 
     Flood_array = (wse_array > E[1:-1, 1:-1]).astype(np.uint8)
@@ -1264,11 +1261,8 @@ def get_params(input_file: str = None, args: dict = None):
         'FLDPLN_Library': data.get('FLDPLN_Library', ''),
         'max_wse_rise': float(data.get('max_wse_rise', 0.01)),
         'FLDPLN_Median_Filter_Size': int(data.get('FLDPLN_Median_Filter_Size', data.get('median_filter_size', 53))),
-        'FLDPLN_DoF_Scale': float(data.get('FLDPLN_DoF_Scale', data.get('dof_scale', 1.55))),
-        'FLDPLN_DoF_Offset': float(data.get('FLDPLN_DoF_Offset', data.get('dof_offset', -0.1))),
         'FLDPLN_Missing_FSP_Interpolation': data.get('FLDPLN_Missing_FSP_Interpolation', data.get('missing_fsp_interpolation', 'ffill')),
         'FLDPLN_DoF_Signal': data.get('FLDPLN_DoF_Signal', data.get('dof_signal', 'min')),
-        'FLDPLN_Threshold_Mode': data.get('FLDPLN_Threshold_Mode', data.get('threshold_mode', 'normal')),
 
         # Multipoint options
         'topwidth_threshold_m': float(data.get('MPI_TopWidth_Threshold_m', 200.0)),

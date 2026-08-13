@@ -968,21 +968,15 @@ def _make_fldpln_flood_map(
         stream_gdf: gpd.GeoDataFrame,
         max_wse_rise: float = 0.01,
         median_filter_size: int = 53,
-        dof_scale: float = 1.55,
-        dof_offset: float = -0.1,
         missing_fsp_interpolation: str = "ffill",
-        dof_signal: str = "min",
-        threshold_mode: str = "normal"):
+        dof_signal: str = "min"):
     nrows, ncols = filled_dem.shape
     median_filter_size = int(median_filter_size)
     if median_filter_size < 1:
         median_filter_size = 1
     if median_filter_size % 2 == 0:
         median_filter_size += 1
-    dof_scale = max(float(dof_scale), 0.0)
-    dof_offset = float(dof_offset)
     dof_signal = str(dof_signal).lower()
-    threshold_mode = str(threshold_mode).lower()
 
     vdt_df = vdt_df.with_columns(FSP=(pl.col('Row') * ncols + pl.col('Col')).cast(pl.Int32))
     fsp_wse_dict = dict(zip(vdt_df['FSP'], vdt_df['WSE']))
