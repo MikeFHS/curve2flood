@@ -755,7 +755,7 @@ def _build_fldpln_library(
         wse_cols = [col for col in vdt_df.columns if col.startswith('wse_')]
         assert wse_cols, "No wse_* columns found in VDT file"
         max_wse_col = wse_cols[-1]
-        vdt_df['depth'] = vdt_df[max_wse_col] - dem_array[vdt_df['Row'], vdt_df['Col']]
+        vdt_df['depth'] = vdt_df[max_wse_col] - filled_dem_array[vdt_df['Row'], vdt_df['Col']]
         ids_max_depths = vdt_df.groupby('COMID', sort=False, as_index=False)['depth'].max().values
         stream_ids = ids_max_depths[:, 0].astype(np.int32)
         max_depths = np.minimum(ids_max_depths[:, 1], fldmx)
