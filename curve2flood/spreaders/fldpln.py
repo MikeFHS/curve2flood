@@ -755,6 +755,8 @@ def _build_fldpln_library(
         wse_cols = [col for col in vdt_df.columns if col.startswith('wse_')]
         assert wse_cols, "No wse_* columns found in VDT file"
         max_wse_col = wse_cols[-1]
+        # making a copy to resolve a fragmentation warning from pandas
+        vdt_df = vdt_df[['COMID', 'Row', 'Col', max_wse_col]].copy()
         vdt_df['depth'] = vdt_df[max_wse_col] - filled_dem_array[vdt_df['Row'], vdt_df['Col']]
         ids_max_depths = vdt_df.groupby('COMID', sort=False, as_index=False)['depth'].max().values
         stream_ids = ids_max_depths[:, 0].astype(np.int32)
@@ -966,6 +968,8 @@ def _make_fldpln_flood_map(
         fldpln_library: pl.LazyFrame,
         stream_info_df: pd.DataFrame,
         stream_gdf: gpd.GeoDataFrame,
+        reach_id_field: str,
+        downstream_reach_id_field: str,
         max_wse_rise: float = 0.01,
         median_filter_size: int = 53,
         missing_fsp_interpolation: str = "ffill",
@@ -985,11 +989,12 @@ def _make_fldpln_flood_map(
     stream_gdf = stream_gdf.sort_values('topological_order')
     G = nx.from_pandas_edgelist(
         stream_gdf,
-        source='LINKNO',
-        target='DSLINKNO',
+        source=reach_id_field,
+        target=downstream_reach_id_field,
         create_using=nx.DiGraph
     )
-    G.remove_node(-1)  # Remove the dummy downstream node
+    if -1 in G:
+        G.remove_node(-1)  # Remove the dummy downstream node
 
     fdr = fdr.ravel()
     stream_rows: dict[list[tuple]] = defaultdict(list)
