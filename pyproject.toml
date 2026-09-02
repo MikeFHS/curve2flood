@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "curve2flood"
+version = "0.3.1"
+description = "Flood mapping tool based on DEM and other inputs."
+authors = [
+    { name = "Michael Follum", email = "mike@follumhydro.com" }
+]
+license = { text = "GPL-3.0" }
+readme = "README.md"
+requires-python = ">=3.10"
+urls = { Homepage = "https://github.com/MikeFHS/curve2flood" }
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "numpy",
+    "pandas",
+    # "gdal", # Let user install GDAL separately to avoid version conflicts
+    "geopandas",
+    "pyyaml",
+    "shapely",
+    "scipy",
+    "numba",
+    "tqdm",
+    "polars",
+    "pyproj",
+]
+
+[project.optional-dependencies]
+all = [
+    "intel-cmplr-lib-rt"
+]
+
+[project.scripts]
+curve2flood = "curve2flood.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
