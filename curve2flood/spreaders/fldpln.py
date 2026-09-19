@@ -1391,7 +1391,8 @@ def _make_fldpln_flood_map(
         reach_id_field: str,
         downstream_reach_id_field: str,
         max_wse_rise: float = 0.5,
-        median_filter_size: int = 53):
+        median_filter_size: int = 53,
+        max_drop_below_source: float = 2.0):
     """Turn a VDT water surface into a flood map using a floodplain library.
 
     Each stream pixel's stage is conditioned along its longest-path chain, then
@@ -1401,6 +1402,17 @@ def _make_fldpln_flood_map(
     ``s`` to ``p``, so the stream pixel's own filled elevation cancels: the
     water lies flat across a floodplain, loses exactly the lip height crossing
     a levee, and fills a depression to the level of its rim.
+
+    That cancellation is only meaningful while ``p`` lies near the level of
+    ``s``.  ``_solve_exact`` charges nothing for a downhill step, so the library
+    pairs every stream pixel with the whole slope beneath it, and the formula
+    then stands the source's own stage on top of whatever ground it finds there.
+    ``max_drop_below_source`` is how far below the source's filled elevation a
+    floodplain pixel may still lie once its stage is spent: a pixel is kept only
+    while ``fil[s] - fil[p] <= DoF(s) + max_drop_below_source``.  Without it a
+    steep reach paints its entire hillside wet -- on a 140 m/4 km reach, 58% of
+    the wet pixels sat more than 20 m below the stream pixel that wetted them
+    and 44% more than 100 m below, some of them 15 km away.
 
     ``median_filter_size`` is the only conditioning knob left.  Measured over
     51 benchmark sites and 809 flow events (MCC inside each site's boundary
@@ -1438,6 +1450,8 @@ def _make_fldpln_flood_map(
 
     # We need to traverse each stream segment, and add missing FSPs to the vdt_df with interpolated DoF values.
     for stream_id in stream_ids:
+        # if stream_id not in  {770294095, 770275374}:
+        #     continue
         if stream_id not in stream_info_dict:
             raise ValueError(f"Stream ID {stream_id} not found in stream_info_df.")
 
@@ -1495,19 +1509,32 @@ def _make_fldpln_flood_map(
         dof_profile = np.minimum(wse_dof, depths_interped)
 
         row_chunks.extend([
-            (fsp, dof)
-            for (fsp, _), dof in zip(path_rows, dof_profile)
+            (fsp, dof, src_fil)
+            for (fsp, _), dof, src_fil in zip(path_rows, dof_profile, filled_dem_profile)
             if np.isfinite(dof)
         ])
 
     if not row_chunks:
         return wse_array
 
-    df = pl.LazyFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32}, orient='row')
+    df = pl.LazyFrame(
+        row_chunks,
+        schema={'FSP': pl.Int32, 'DoF': pl.Float32, 'SrcFil': pl.Float32},
+        orient='row',
+    )
 
     # merge the two dataframes on the row and column indices
-    fldpln_library = fldpln_library.join(df, on='FSP', how='inner')
-    fldpln_library = fldpln_library.with_columns(
+    joined = fldpln_library.join(df, on='FSP', how='inner').collect()
+    # Keep only the pairs whose source can still stand over the pixel once its
+    # stage is spent.  The library's downhill edges are free, so without this a
+    # stream pixel reaches every cell that drains past it, however far below.
+    joined = joined.with_columns(
+        FppFil=pl.Series('FppFil', filled_dem.ravel()[joined['FPP'].to_numpy()])
+    ).filter(
+        pl.col('SrcFil') - pl.col('FppFil') <= pl.col('DoF') + max_drop_below_source
+    )
+
+    fldpln_library = joined.lazy().with_columns(
         DTF=(pl.col('DoF') - pl.col('DTF'))
     )
     # ``DoF - DTF`` is the head left over at the floodplain pixel, measured from

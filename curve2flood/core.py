@@ -900,7 +900,9 @@ def make_fldpln_flood_map(
         streams_gdf,
         params['reach_id_field'],
         params['downstream_reach_id_field'],
+        max_wse_rise=params['FLDPLN_Max_WSE_Rise'],
         median_filter_size=params['FLDPLN_Median_Filter_Size'],
+        max_drop_below_source=params['FLDPLN_Max_Drop_Below_Source'],
     )
 
     Flood_array = (wse_array > E[1:-1, 1:-1]).astype(np.uint8)
@@ -1259,8 +1261,9 @@ def get_params(input_file: str = None, args: dict = None):
         'Filled_DEM_File': data.get('Filled_DEM_File', ''),
         'Stream_Info_File': data.get('Stream_Info_File', ''),
         'FLDPLN_Library': data.get('FLDPLN_Library', ''),
-        'max_wse_rise': float(data.get('max_wse_rise', 0.01)),
+        'FLDPLN_Max_WSE_Rise': float(data.get('max_wse_rise', data.get('FLDPLN_Max_WSE_Rise', 0.01))),
         'FLDPLN_Median_Filter_Size': int(data.get('FLDPLN_Median_Filter_Size', data.get('median_filter_size', 53))),
+        'FLDPLN_Max_Drop_Below_Source': float(data.get('FLDPLN_Max_Drop_Below_Source', data.get('max_drop_below_source', 2.0))),
 
         # Multipoint options
         'topwidth_threshold_m': float(data.get('MPI_TopWidth_Threshold_m', 200.0)),
