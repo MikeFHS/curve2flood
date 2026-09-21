@@ -2,3 +2,5 @@ __pycache__
 .vscode
 *.egg-info
 build/
+.numba_cache/
+tests\data\scottsbluff_fldpln\outputs\

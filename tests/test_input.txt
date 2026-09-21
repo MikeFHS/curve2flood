@@ -1,0 +1,14 @@
+
+        DEM_File path/to/dem.tif
+        Stream_File path/to/strm.tif
+        LU_Raster_SameRes path/to/land.tif
+        StrmShp_File path/to/streams.shp
+        OutFLD path/to/output_flood.tif
+        LU_Water_Value  80
+        Q_Fraction 0.5
+        TopWidthPlausibleLimit 200
+        TW_MultFact 1.0
+        Set_Depth 0.1
+        LocalFloodOption True
+        Flood_WaterLC_and_STRM_Cells False
+        

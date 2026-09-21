@@ -39,7 +39,6 @@ LU_Raster_SameRes  path/to/land.tif
 StrmShp_File  path/to/streams.shp
 OutFLD  path/to/output_flood.tif
 LAND_WaterValue  80
-Q_Fraction  0.5
 TopWidthPlausibleLimit  200
 TW_MultFact  1.0
 Set_Depth  0.1
@@ -65,6 +64,6 @@ Flood_WaterLC_and_STRM_Cells  False
 - Converts the smoothed profile to depth-of-flood and queries the FLDPLN library.
 - Keeps cells that remain hydraulically connected to stream cells.
 
-FLDPLN map controls include `FLDPLN_Median_Filter_Size`, `FLDPLN_DoF_Scale`, `FLDPLN_DoF_Offset`, `FLDPLN_Missing_FSP_Interpolation`, `FLDPLN_DoF_Signal`, and `FLDPLN_Threshold_Mode`.
+The FLDPLN map has one control, `FLDPLN_Median_Filter_Size` (default 53), which sets the running-median window used to condition the water-surface profile along each stream chain.
 
 The Scottsbluff FLDPLN integration test and tuning notes are in `docs/scottsbluff_fldpln_csi.md` and `docs/scottsbluff_fldpln_research.md`. Multi-site FLDPLN research is in `docs/fldpln_multi_site_research.md`.

@@ -852,7 +852,7 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(params: dict, E, COMID_Unique_Flow, 
     if not quiet:
         for idx, comid in enumerate(COMID_Unique):
             if COMID_Unique_TW[comid]>TopWidthPlausibleLimit:
-                LOG.warning(f"Ignoring {comid}  {COMID_Unique_Flow[comid]}  {COMID_Unique_Flow[comid]*params['Q_Fraction']}  {COMID_Unique_Depth[comid]}  {COMID_Unique_TW[comid]}")  
+                LOG.warning(f"Ignoring {comid}  {COMID_Unique_Flow[comid]}  {COMID_Unique_Depth[comid]}  {COMID_Unique_TW[comid]}")
 
     if TopWidthPlausibleLimit < TopWidthMax:
         TopWidthMax = TopWidthPlausibleLimit
@@ -900,10 +900,9 @@ def make_fldpln_flood_map(
         streams_gdf,
         params['reach_id_field'],
         params['downstream_reach_id_field'],
-        max_wse_rise=params['max_wse_rise'],
+        max_wse_rise=params['FLDPLN_Max_WSE_Rise'],
         median_filter_size=params['FLDPLN_Median_Filter_Size'],
-        missing_fsp_interpolation=params['FLDPLN_Missing_FSP_Interpolation'],
-        dof_signal=params['FLDPLN_DoF_Signal'],
+        max_drop_below_source=params['FLDPLN_Max_Drop_Below_Source'],
     )
 
     Flood_array = (wse_array > E[1:-1, 1:-1]).astype(np.uint8)
@@ -1246,7 +1245,6 @@ def get_params(input_file: str = None, args: dict = None):
         'VDTDatabaseFileName': data.get('Print_VDT_Database', ''),
         'CurveParamFileName': data.get('Print_Curve_File', ''),
         'mapper': data.get('mapper', "Curve2Flood-Kernel Weighted"),
-        'Q_Fraction': float(data.get('Q_Fraction', 1.0)),
         'TopWidthPlausibleLimit': float(data.get('TopWidthPlausibleLimit', 1000.0)),
         'TW_MultFact': float(data.get('TW_MultFact', 3.0)),
         'Set_Depth': min(float(data.get('Set_Depth', -1.1)), float(data.get('FloodSpreader_SpecifyDepth', -1.1))),
@@ -1263,10 +1261,9 @@ def get_params(input_file: str = None, args: dict = None):
         'Filled_DEM_File': data.get('Filled_DEM_File', ''),
         'Stream_Info_File': data.get('Stream_Info_File', ''),
         'FLDPLN_Library': data.get('FLDPLN_Library', ''),
-        'max_wse_rise': float(data.get('max_wse_rise', 0.01)),
+        'FLDPLN_Max_WSE_Rise': float(data.get('max_wse_rise', data.get('FLDPLN_Max_WSE_Rise', 0.01))),
         'FLDPLN_Median_Filter_Size': int(data.get('FLDPLN_Median_Filter_Size', data.get('median_filter_size', 53))),
-        'FLDPLN_Missing_FSP_Interpolation': data.get('FLDPLN_Missing_FSP_Interpolation', data.get('missing_fsp_interpolation', 'ffill')),
-        'FLDPLN_DoF_Signal': data.get('FLDPLN_DoF_Signal', data.get('dof_signal', 'min')),
+        'FLDPLN_Max_Drop_Below_Source': float(data.get('FLDPLN_Max_Drop_Below_Source', data.get('max_drop_below_source', 2.0))),
 
         # Multipoint options
         'topwidth_threshold_m': float(data.get('MPI_TopWidth_Threshold_m', 200.0)),
@@ -1304,7 +1301,9 @@ def get_params(input_file: str = None, args: dict = None):
 
 def validate_params(params: dict):
     required_params = []
-    if params['Flood_File'] or params['OutDEP'] or params['OutWSE'] or params['OutVEL'] or (params['BathyOutputFileName'] and params['BathyFromARFileName'] and not path_exists(params['BathyWaterMaskFileName'])):
+    if (params['Flood_File'] or params['OutDEP'] or params['OutWSE'] or params['OutVEL'] or \
+        (params['BathyOutputFileName'] and params['BathyFromARFileName'] and not path_exists(params['BathyWaterMaskFileName']))) and \
+        not params['Set_Depth'] <= 0.0:
         required_params.append('FlowFileName')
 
     if params['mapper'] == "Curve2Flood-FLDPLNpy":
@@ -1354,6 +1353,10 @@ def main_flood_ouputs(
 
         if Path(params['FLDPLN_Library']).suffix == '.parquet':
             fldpln_library = pl.scan_parquet(params['FLDPLN_Library'])
+            fldpln_library = fldpln_library.with_columns(
+                [pl.col(c).cast(pl.Float32)
+                for c, d in fldpln_library.collect_schema().items() if d == pl.Decimal]
+            )
         else:
             fldpln_library = pl.scan_csv(params['FLDPLN_Library'])
     else:
