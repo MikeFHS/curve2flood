@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "docs-variants",
+      "runtimeExecutable": "C:/Users/lrr43/AppData/Local/miniforge3/envs/nencarta/python.exe",
+      "runtimeArgs": ["-m", "http.server", "8765", "-d", "C:/Users/lrr43/AppData/Local/Temp/claude/C--Users-lrr43-curve2flood/6b2b3d5d-4446-4c48-aece-df043921f5d4/scratchpad/sites"],
+      "port": 8765
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+# conda env create -f environment.yml
+# conda activate curve2flood
+# pip install --no-deps -e .
+name: curve2flood
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - gdal
+  - geopandas
+  - numba
+  - numpy
+  - pandas
+  - polars
+  - pyarrow>=18
+  - pyproj
+  - pyyaml
+  - scipy
+  - shapely
+  - tqdm
+  # for the tests
+  - pytest
