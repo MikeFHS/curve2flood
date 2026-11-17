@@ -1,6 +1,7 @@
 numba
 numpy
 pandas
+pyarrow>=18
 gdal
 geopandas
 pyyaml

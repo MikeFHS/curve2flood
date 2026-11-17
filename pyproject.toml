@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "curve2flood"
-version = "0.4.0"
+version = "2026.11.17"
 description = "Flood mapping tool based on DEM and other inputs."
 authors = [
     { name = "Michael Follum", email = "mike@follumhydro.com" }
@@ -23,6 +23,7 @@ classifiers = [
 dependencies = [
     "numpy",
     "pandas",
+    "pyarrow>=18",
     # "gdal", # Let user install GDAL separately to avoid version conflicts
     "geopandas",
     "pyyaml",
@@ -38,9 +39,23 @@ dependencies = [
 all = [
     "intel-cmplr-lib-rt"
 ]
+test = [
+    "pytest"
+]
 
 [project.scripts]
 curve2flood = "curve2flood.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["curve2flood*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+extend-exclude = [
+    "tests/*.py",
+    "docs",
+    "benchmarks"
+]

@@ -1,69 +1,36 @@
 # Curve2Flood
-Curve2Flood is a Python library and CLI tool that creates flood inundation maps and optional topobathymetric surfaces from ARC rating-curve and VDT inputs.
 
+Curve2Flood turns river flows into flood inundation maps. It reads the rating curves that
+[ARC](https://github.com/MikeFHS/automated-rating-curve) builds for every stream cell of a DEM, finds each stream
+cell's water surface for a flow, and spreads that water over the land. It writes rasters of the flood's extent, depth,
+water surface elevation and velocity, and it can generate topobathymetry by burning ARC's channel bathymetry into the DEM.
 
-## Installation
+See the [documentation](docs/index.md) for how it works and every setting.
 
-Clone or download this repository. Once you've got a local copy, navigate to the curve2flood directory and use pip to install Curve2Flood into your Python environment with the command below.
+## Getting started
+
+1. Install [Miniforge](https://conda-forge.org/download/) or [Miniconda](https://docs.anaconda.com/miniconda/) if you
+   don't have conda yet.
+2. Get the code:
+   ```bash
+   git clone https://github.com/MikeFHS/curve2flood
+   cd curve2flood
+   ```
+3. Create the conda environment from [environment.yml](environment.yml), activate it, and install Curve2Flood into it:
+   ```bash
+   conda env create -f environment.yml
+   conda activate curve2flood
+   pip install --no-deps .
+   ```
+4. Run `curve2flood -h` to check that it works, and `curve2flood path/to/input_file.yaml` to map a flood. The
+   [Getting Started](docs/getting_started.md) page shows a minimal input file.
+
+## Tests
 
 ```bash
-pip install .
+pytest
 ```
 
-## Usage
+## License
 
-Once installed, you can run Curve2Flood as a typical Python library or a command-line utility.
-
-### As a Library
-
-```python
-from curve2flood import Curve2Flood_MainFunction
-
-Curve2Flood_MainFunction("path/to/input_file.txt")
-```
-
-### Command Line
-
-```bash
-curve2flood path/to/input_file.txt
-```
-
-### Input File Format
-
-The input file can be a YAML file or a plain text file with key-value pairs, e.g.:
-
-```
-DEM_File  path/to/dem.tif
-Stream_File  path/to/strm.tif
-LU_Raster_SameRes  path/to/land.tif
-StrmShp_File  path/to/streams.shp
-OutFLD  path/to/output_flood.tif
-LAND_WaterValue  80
-TopWidthPlausibleLimit  200
-TW_MultFact  1.0
-Set_Depth  0.1
-LocalFloodOption  True
-Flood_WaterLC_and_STRM_Cells  False
-```
-
-### Mapper Options
-
-`mapper` controls the flood-spreading method.
-
-- `Curve2Flood-Kernel Weighted`: Uses weighted WSE spreading from stream cells.
-- `Curve2Flood-FLDPLNpy`: Uses a precomputed FLDPLN library, filled DEM, flow-direction raster, stream metadata, and VDT WSE values.
-- `Curve2Flood-Mult-Point`: Uses the FHS-style multi-point interpolation workflow.
-
-### FLDPLN Behavior
-
-`Curve2Flood-FLDPLNpy` currently:
-
-- Interpolates WSE from the VDT database for the active flow event.
-- Builds stream-path WSE and depth profiles from the stream graph.
-- Smooths the profiles with an odd median filter window.
-- Converts the smoothed profile to depth-of-flood and queries the FLDPLN library.
-- Keeps cells that remain hydraulically connected to stream cells.
-
-The FLDPLN map has one control, `FLDPLN_Median_Filter_Size` (default 53), which sets the running-median window used to condition the water-surface profile along each stream chain.
-
-The Scottsbluff FLDPLN integration test and tuning notes are in `docs/scottsbluff_fldpln_csi.md` and `docs/scottsbluff_fldpln_research.md`. Multi-site FLDPLN research is in `docs/fldpln_multi_site_research.md`.
+Curve2Flood is released under the [GNU General Public License v3](LICENSE).

@@ -1,0 +1,5 @@
+mkdocs<2
+pymdown-extensions>=10
+mkdocstrings[python]
+mkdocs-material
+ruff
