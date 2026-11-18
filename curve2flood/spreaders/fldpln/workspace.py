@@ -3,8 +3,12 @@ from numba import njit
 
 from .solvers import _iterative_arrays, _solve_iterative_reusing
 
-# Segments a Workspace solves before it starts again on new arrays: the cells segments flood take memory until then
-_RENEW_EVERY = 8
+# Segments a Workspace solves before it starts again on new arrays: the cells segments flood take memory until then.
+# Each new start costs the faults of the pages written again: on a hilly one-degree tile, renewing every 8 segments
+# built the library in four times the time of every 1024 (57.6 s against 15.6 s), for 0.94 GB rather than 1.66 GB
+# (1.75 GB never renewing), and every 64 already took 1.44 GB.  On a flat tile, whose segments flood most of the
+# raster, renewing every 8 saved 0.12 GB of 2 GB, and took 11% longer.
+_RENEW_EVERY = 1024
 
 class Workspace:
     """One thread's iterative solver, on the whole raster, kept from one segment to the next.

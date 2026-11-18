@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+from numba import njit
 import pyarrow.parquet as pq
 
 from curve2flood.config import is_parquet
@@ -21,8 +22,9 @@ DECIMAL_COLS = {"DTF": pa.decimal32(5, 2), "fill": pa.decimal32(7, 2)}
 # save_library.
 _LIBRARY_SLICE_ROWS = 1 << 20
 
-# zstd's level for a Parquet library.
-_ZSTD_LEVEL = 6
+# zstd's level for a Parquet library.  On a flat tile's library of a billion rows, 3 wrote it in two thirds of 6's
+# time, 4% larger, and read as fast; 1 and lz4 were read slower.
+_ZSTD_LEVEL = 3
 
 # The key of a Parquet library's metadata (see library_metadata)
 METADATA_KEY = b"curve2flood:fldpln_library"
@@ -169,10 +171,26 @@ class LibraryWriter:
 
 def _as_decimal(values: np.ndarray, kind: pa.Decimal32Type) -> pa.Array:
     """``values`` (metres) as ``kind``, a decimal32 of hundredths, as Arrow's cast of them as float32 rounded to two
-    places, at a quarter of its cost."""
-    hundredths = np.round(values.astype(np.float32).round(2).astype(np.float64) * 100.0)
-    limit = 10.0 ** kind.precision
-    if not (np.abs(hundredths) < limit).all():
-        raise ValueError(f"A value doesn't fit {kind}: {values[~(np.abs(hundredths) < limit)][:3]}.")
-    
-    return pa.Array.from_buffers(kind, hundredths.size, [None, pa.py_buffer(hundredths.astype(np.int32))])
+    places, at a fraction of its cost."""
+    hundredths, bad = _hundredths(np.ascontiguousarray(values, dtype=np.float32), 10.0 ** kind.precision)
+    if bad >= 0:
+        raise ValueError(f"A value doesn't fit {kind}: {values[bad:bad + 3]}.")
+
+    return pa.Array.from_buffers(kind, hundredths.size, [None, pa.py_buffer(hundredths)])
+
+
+@njit(cache=True, nogil=True)
+def _hundredths(values: np.ndarray, limit: float) -> tuple[np.ndarray, int]:
+    """float32 ``values`` as int32 hundredths, in one pass: NumPy's float32 ``round(2)`` (times 100, to the nearest
+    even, divided by 100, all in float32), then times 100 in float64 and to the nearest even again.  Also where the
+    first that isn't below ``limit`` in size (or isn't a number) is, or -1."""
+    out = np.empty(values.size, dtype=np.int32)
+    hundred = np.float32(100.0)
+    for i in range(values.size):
+        rounded = np.float32(np.rint(values[i] * hundred) / hundred)
+        h = np.rint(np.float64(rounded) * 100.0)
+        if not abs(h) < limit:
+            return out, i
+        out[i] = np.int32(h)
+
+    return out, -1
