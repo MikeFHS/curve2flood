@@ -1,6 +1,8 @@
+import base64
 import json
 import os
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -30,6 +32,10 @@ _ZSTD_LEVEL = 3
 METADATA_KEY = b"curve2flood:fldpln_library"
 # The version of that metadata's layout
 METADATA_VERSION = 1
+# The key of a Parquet library's footer metadata that keeps its cells' fill (see fill_footer), and the version of its
+# layout
+FILL_KEY = b"curve2flood:fldpln_fill"
+FILL_VERSION = 1
 
 
 def library_metadata(path: str | os.PathLike) -> dict | None:
@@ -38,7 +44,9 @@ def library_metadata(path: str | os.PathLike) -> dict | None:
     ``nrows``, ``ncols``, ``geotransform`` and ``crs`` (WKT) are the grid
     its pixel ids number, so a flood map needs no DEM to know where it is;
     ``cell_size_m`` is its cells' size in metres, ``build`` the build's
-    settings and ``curve2flood`` the version that built it.
+    settings and ``curve2flood`` the version that built it.  A library
+    built by ``build_fldpln_library`` keeps its cells' fill elsewhere in
+    its footer (see ``library_fill``).
     """
     if not is_parquet(path):
         return None
@@ -48,6 +56,78 @@ def library_metadata(path: str | os.PathLike) -> dict | None:
         return None
     
     return json.loads(metadata[METADATA_KEY])
+
+
+def fill_footer(cells: np.ndarray, fill: np.ndarray) -> dict[bytes, bytes]:
+    """The footer metadata that keeps a library's fill once a cell, rather than in a column: ``fill`` (metres) at
+    ``cells`` (flat pixel ids, ascending, each once), in hundredths of a metre as a fill column stores it
+    (``DECIMAL_COLS``), and only where that isn't 0.
+
+    A cell's fill is the same in every row of it, but a cell is in many
+    rows, millions of rows apart, and Parquet compresses each page on its
+    own: a column of them took a third of a flat tile's library (416 of
+    1268 MB, for 80 rows a cell).  Once a cell, its 3.8 million fills took
+    5 MB.
+
+    The value is JSON: ``version`` (``FILL_VERSION``), ``cells``, how
+    many cells have a fill, and ``data``, the base64 of zstd's
+    compression of their int32 gaps (from 0 to the first cell, and then
+    from each to the next) and then of their int32 fills in hundredths,
+    each array split into its four little-endian byte streams, as
+    Parquet's BYTE_STREAM_SPLIT does.  Base64, because polars won't open
+    a Parquet file whose metadata isn't UTF-8.
+    """
+    hundredths, bad = _hundredths(np.ascontiguousarray(fill, dtype=np.float32),
+                                  10.0 ** DECIMAL_COLS["fill"].precision)
+    if bad >= 0:
+        raise ValueError(f"A fill doesn't fit {DECIMAL_COLS['fill']}: {fill[bad:bad + 3]}.")
+
+    kept = hundredths != 0
+    cells = np.asarray(cells, dtype=np.int64)[kept]
+    gaps = np.diff(cells, prepend=0)
+    if cells.size and (cells[0] < 0 or cells[-1] >= 2 ** 31 or (gaps[1:] <= 0).any()):
+        raise ValueError("A library's fill needs its cells' ids ascending, each once, from 0 up to 2**31 - 1.")
+
+    data = _split(gaps) + _split(hundredths[kept])
+    value = {"version": FILL_VERSION, "cells": int(cells.size),
+             "data": base64.b64encode(pa.Codec("zstd", compression_level=_ZSTD_LEVEL).compress(data, asbytes=True))
+             .decode("ascii")}
+    return {FILL_KEY: json.dumps(value).encode()}
+
+
+def library_fill(path: str | os.PathLike) -> tuple[np.ndarray, np.ndarray] | None:
+    """A Parquet library's fill kept in its footer (``fill_footer``): the cells whose fill isn't 0, as int64
+    flat pixel ids, ascending, and their fills, int32 hundredths of a metre.  None for a library without it, whose
+    fill is its ``fill`` column (a CSV library, or one written by ``save_library``)."""
+    if not is_parquet(path):
+        return None
+
+    value = (pq.ParquetFile(path).metadata.metadata or {}).get(FILL_KEY)
+    if value is None:
+        return None
+
+    fill = json.loads(value)
+    if fill.get("version") != FILL_VERSION:
+        raise ValueError(f"{path} keeps its fill in layout version {fill.get('version')}; this curve2flood reads "
+                         f"version {FILL_VERSION}.")
+
+    n = int(fill["cells"])
+    if n == 0:
+        return np.empty(0, np.int64), np.empty(0, np.int32)
+
+    data = pa.Codec("zstd").decompress(base64.b64decode(fill["data"]), decompressed_size=8 * n, asbytes=True)
+    return np.cumsum(_unsplit(data[:4 * n]), dtype=np.int64), _unsplit(data[4 * n:])
+
+
+def _split(values: np.ndarray) -> bytes:
+    """``values`` as little-endian int32, their bytes split into four streams: each value's first byte, then
+    second, third and fourth."""
+    return np.ascontiguousarray(values, dtype="<i4").view(np.uint8).reshape(-1, 4).T.tobytes()
+
+
+def _unsplit(data: bytes) -> np.ndarray:
+    """The int32 values of ``_split``'s bytes."""
+    return np.frombuffer(data, np.uint8).reshape(4, -1).T.copy().view("<i4").ravel().astype(np.int32, copy=False)
 
 
 class LibraryWriter:
@@ -60,12 +140,16 @@ class LibraryWriter:
     None.  With ``background``, ``write_later`` makes and writes the rows in
     a thread of the writer's own, at most ``_WRITES_AHEAD`` parts behind.
     ``metadata`` (see ``library_metadata``) is stored in a Parquet library;
-    a CSV library has nowhere to keep it.
+    a CSV library has nowhere to keep it.  ``footer``, if given, is called
+    once all the rows are written, and its key-value metadata is added to a
+    Parquet library's footer (see ``fill_footer``); it isn't called for a
+    CSV library.
     """
 
     def __init__(self, path: str | os.PathLike, parquet: bool | None = None, background: bool = False,
-                 metadata: dict | None = None):
+                 metadata: dict | None = None, footer: Callable[[], dict[bytes, bytes]] | None = None):
         self.path = Path(path)
+        self._footer = footer
         self._thread = ThreadPoolExecutor(1) if background else None
         self._queued = deque()
         self.parquet = is_parquet(self.path) if parquet is None else parquet
@@ -91,6 +175,8 @@ class LibraryWriter:
                     self._thread.shutdown(wait=True, cancel_futures=True)
             if kind is None:
                 self._flush(final=True)
+                if self._footer is not None and self._writer is not None:
+                    self._writer.add_key_value_metadata(self._footer())
                 finished = True
         finally:
             if self._writer is not None:

@@ -3,13 +3,14 @@ from typing import TYPE_CHECKING
 
 from ._log import LOG
 from .config import Config
-from .core import Curve2Flood_MainFunction, remove_cells_not_connected
+from .core import Curve2Flood_Batch, Curve2Flood_MainFunction, remove_cells_not_connected
 
 if TYPE_CHECKING:
     # For type checkers and the API docs: it is imported when first asked for (see __getattr__)
     from .spreaders.fldpln.library import build_fldpln_library
 
-__all__ = ["LOG", "Config", "Curve2Flood_MainFunction", "build_fldpln_library", "remove_cells_not_connected"]
+__all__ = ["LOG", "Config", "Curve2Flood_Batch", "Curve2Flood_MainFunction", "build_fldpln_library",
+           "remove_cells_not_connected"]
 
 
 def __getattr__(name):

@@ -13,6 +13,7 @@ from scipy.ndimage import generate_binary_structure, label, uniform_filter
 from curve2flood import (
     LOG,
     Config,
+    Curve2Flood_Batch,
     Curve2Flood_MainFunction,
     _ids,
     _raster,
@@ -24,6 +25,7 @@ from curve2flood import (
     remove_cells_not_connected,
 )
 from curve2flood.spreaders import fldpln, multi_point
+from curve2flood.spreaders.fldpln import mapping as fldpln_mapping
 
 gdal.UseExceptions()
 
@@ -393,13 +395,18 @@ def _fldpln_depth(tmp_path, vdt_columns=None, library_metadata=None, with_dem=Tr
 
 def _rerun_fldpln(tmp_path, with_dem=True, **inputs):
     """Map ``_fldpln_depth``'s inputs, which it made, again, with these inputs."""
-    Curve2Flood_MainFunction(args={
+    Curve2Flood_MainFunction(args=_fldpln_args(tmp_path, with_dem, **inputs), quiet=True)
+
+
+def _fldpln_args(tmp_path, with_dem=True, **inputs):
+    """The settings ``_rerun_fldpln`` maps with."""
+    return {
         "Print_VDT_Database": tmp_path / "vdt.pq",
         "COMID_Flow_File": tmp_path / "flows.pq", "mapper": "Curve2Flood-FLDPLNpy",
         "Flow_Direction_File": tmp_path / "flowdir.tif", "Stream_Info_File": tmp_path / "stream_info.pq",
         "FLDPLN_Library": tmp_path / "library.pq", "Make_Output_GPKG": False,
         **({"DEM_File": tmp_path / "dem.tif"} if with_dem else {}), **inputs,
-    }, quiet=True)
+    }
 
 
 def test_the_fldpln_mapper_floods_only_from_its_minimum_depth(tmp_path):
@@ -695,6 +702,44 @@ def test_each_cell_floods_in_the_percentage_of_the_events_that_flood_it(tmp_path
     assert flood[1].tolist() == [100] * 5
     assert flood[0, 0] == 33 and flood.sum() == 5 * 100 + 33
     assert gdal.Open(str(tmp_path / "depth.tif")).ReadAsArray()[0, 0] == pytest.approx(1.3)
+
+
+def test_a_batch_maps_each_run_as_it_maps_alone_reading_the_library_once(tmp_path, monkeypatch):
+    """Three runs of _fldpln_depth's inputs, a flow file of three events and two of one, mapped together: each run's
+    flood, depth and WSE rasters are what it maps alone, but the library's stream pixels and fills are read once for
+    all of them, and its depths in two passes, of the three events that fit in one and of the other two."""
+    _fldpln_depth(tmp_path)
+    flows = {"a": {"q_a": [15.0], "q_b": [1.5], "q_c": [1.5]}, "b": {"q": [1.5]}, "c": {"q": [15.0]}}
+    for name, columns in flows.items():
+        pd.DataFrame({"COMID": [1], **columns}).to_parquet(tmp_path / f"flows_{name}.pq")
+
+    def settings(name, folder):
+        folder.mkdir(exist_ok=True)
+        outputs = {"OutFLD": folder / f"{name}_flood.tif", "OutDEP": folder / f"{name}_depth.tif"}
+        if name == "b":
+            outputs["OutWSE"] = folder / f"{name}_wse.tif"
+        return _fldpln_args(tmp_path, COMID_Flow_File=tmp_path / f"flows_{name}.pq", **outputs)
+
+    for name in flows:
+        Curve2Flood_MainFunction(args=settings(name, tmp_path / "alone"), quiet=True)
+
+    passes, reads = [], []
+    flood_depths, library_sources = fldpln_mapping._flood_depths, core.library_sources
+    monkeypatch.setattr(fldpln_mapping, "_flood_depths", lambda library, key, dof, best: (
+        passes.append(dof.shape[1]), flood_depths(library, key, dof, best)))
+    monkeypatch.setattr(core, "library_sources", lambda *args, **kwargs: (
+        reads.append(1), library_sources(*args, **kwargs))[1])
+    monkeypatch.setattr(fldpln_mapping, "_PASS_BYTES", 3 * 15 * 4)  # Three events of the 3x5 grid
+    Curve2Flood_Batch([settings(name, tmp_path / "together") for name in flows], quiet=True)
+
+    assert passes == [3, 2] and reads == [1]
+    names = sorted(path.name for path in (tmp_path / "alone").iterdir())
+    assert len(names) == 7 and names == sorted(path.name for path in (tmp_path / "together").iterdir())
+    for name in names:
+        alone = gdal.Open(str(tmp_path / "alone" / name)).ReadAsArray()
+        together = gdal.Open(str(tmp_path / "together" / name)).ReadAsArray()
+        assert np.array_equal(alone, together, equal_nan=True), name
+    assert gdal.Open(str(tmp_path / "together" / "a_flood.tif")).ReadAsArray()[0, 0] == 33
 
 
 def test_a_flow_file_has_at_most_655_events_and_no_negative_flow(tmp_path):

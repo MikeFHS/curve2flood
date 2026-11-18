@@ -15,7 +15,17 @@ The DTFs are measured on a DEM with its depressions filled, so water can always 
 saved in a **floodplain library**, built once for a DEM and stream network, with a row for each pair of a stream pixel
 (the flood source pixel, `FSP`) and a cell it can flood (the floodplain pixel, `FPP`), its `DTF`, the `segment` of
 stream the source pixel belongs to, and the cell's `fill`: how far the filled DEM sits above the DEM there, as in a
-filled pit or a burned channel.
+filled pit or a burned channel. A cell's fill is the same in every row of it, so a Parquet library keeps it once a
+cell, in its footer metadata, rather than as a column: a cell's rows are far apart in the library, and on a flat tile a
+`fill` column took a third of it (416 of 1268 MB), where the footer takes 5 MB. A CSV library has a `fill` column, and
+so does a library saved with `save_library`; the mapper reads either.
+
+The footer key is `curve2flood:fldpln_fill`, and its value JSON: `version` (1), `cells`, how many cells have a fill
+other than 0, and `data`, base64 of zstd-compressed bytes: the int32 gaps between those cells' pixel ids (from 0 to the
+first, then from each to the next), followed by their int32 fills in hundredths of a metre, each array split into its
+four little-endian byte streams as Parquet's `BYTE_STREAM_SPLIT` does. A cell of the library that isn't listed has a
+fill of 0. pyarrow reads it with `pq.ParquetFile(path).metadata.metadata` (`pq.read_schema` doesn't show it), and
+`curve2flood.spreaders.fldpln.library_writer.library_fill(path)` decodes it.
 
 A segment's stream pixels all start at the same depth, so each cell keeps the one pixel of the segment that reaches it
 at the smallest depth. The library is therefore exact for **one water depth per segment**. One depth suits a short stretch of river better than a

@@ -629,9 +629,9 @@ def _slope(nrows=40, ncols=40, drop_per_row=0.5):
     return fil, fdr, info
 
 
-def _slope_library(tmp_path, name, dem=None, filled=None, **kwargs):
+def _slope_library(tmp_path, name, dem=None, filled=None, suffix=".parquet", **kwargs):
     """The library of ``_slope`` (with ``filled`` for its filled DEM, if given), mapped on ``dem`` (the filled DEM
-    when None)."""
+    when None), saved as ``name`` with ``suffix``."""
     from osgeo import gdal
     fil, fdr, info = _slope()
     fil = fil if filled is None else filled
@@ -643,23 +643,35 @@ def _slope_library(tmp_path, name, dem=None, filled=None, **kwargs):
         ds = None
     pd.DataFrame(info, columns=["start_pixel", "end_pixel", "length", "stream_id"]).to_parquet(tmp_path / "info.parquet")
     F.build_fldpln_library(str(tmp_path / "dem.tif"), str(tmp_path / "filled.tif"), str(tmp_path / "info.parquet"),
-                           str(tmp_path / "flowdir.tif"), str(tmp_path / f"{name}.parquet"), dh=0.1, fldmn=0.1,
+                           str(tmp_path / "flowdir.tif"), str(tmp_path / f"{name}{suffix}"), dh=0.1, fldmn=0.1,
                            fldmx=1.0, iterative_spill=False, pbar=False, **kwargs)
-    return pd.read_parquet(tmp_path / f"{name}.parquet")
+    path = tmp_path / f"{name}{suffix}"
+    return pd.read_csv(path) if suffix == ".csv" else pd.read_parquet(path)
 
 
-def test_library_fill_is_the_filled_dem_above_the_dem(tmp_path):
+@pytest.mark.parametrize("suffix", [".parquet", ".csv"])
+def test_library_fill_is_the_filled_dem_above_the_dem(tmp_path, suffix):
+    """Each cell's fill is the filled DEM above the DEM: a Parquet library keeps it once a cell, in its footer, and a
+    CSV library, which has no footer, in a column."""
     fil = _slope()[0]
     ncols = fil.shape[1]
     dem = fil - 0.25
     dem[8, 12] -= 2.75     # a pit 3 m below the filled DEM
     dem[9, 15] = -9999.0   # no data
-    library = _slope_library(tmp_path, "fill", dem=dem)
-    fpp, fill = library["FPP"].to_numpy(), library["fill"].astype(float).to_numpy()
+    library = _slope_library(tmp_path, "fill", dem=dem, suffix=suffix)
+    fpp = library["FPP"].to_numpy()
     assert len(library) and (fpp != 9 * ncols + 15).all()  # a cell without a DEM value never floods
-    pit = fpp == 8 * ncols + 12
-    assert pit.any() and np.allclose(fill[pit], 3.0)
-    assert np.allclose(fill[~pit], 0.25)
+    pit = 8 * ncols + 12
+    assert (fpp == pit).any()
+    if suffix == ".csv":
+        fill = library["fill"].astype(float).to_numpy()
+        assert np.allclose(fill[fpp == pit], 3.0) and np.allclose(fill[fpp != pit], 0.25)
+        return
+
+    assert "fill" not in library.columns
+    cells, hundredths = LW.library_fill(tmp_path / "fill.parquet")
+    assert cells.tolist() == np.unique(fpp).tolist()  # every cell here has a fill other than 0, listed once
+    assert hundredths[cells == pit].tolist() == [300] and (hundredths[cells != pit] == 25).all()
 
 
 def test_library_needs_the_dem_on_the_same_grid(tmp_path):
@@ -1032,6 +1044,48 @@ def test_library_writer_writes_whole_row_groups_whatever_the_parts(tmp_path, mon
     assert np.allclose(csv["DTF"], columns["DTF"])
 
 
+def test_the_fill_footer_keeps_the_fills_a_column_would_once_a_cell(tmp_path):
+    """fill_footer keeps the fills other than 0, as the hundredths a fill column stores, and library_fill reads them
+    back; its JSON is UTF-8, which polars needs to open the file.  A library without it, or a CSV library, has none,
+    and a CSV library's writer never asks for it."""
+    import json
+    import polars as pl
+    import pyarrow.parquet as pq
+    rng = np.random.default_rng(5)
+    cells = np.sort(rng.choice(5_000_000, 3000, replace=False))
+    fill = rng.uniform(-3, 30, cells.size).astype(np.float32)
+    fill[::7] = 0.0
+    fill[1::7] = 0.004  # 0 in hundredths
+    rows = {c: v for c, v in _toy_library().items() if c != "fill"}
+    path = tmp_path / "footer.parquet"
+    with LW.LibraryWriter(path, footer=lambda: LW.fill_footer(cells, fill)) as writer:
+        writer.write(rows)
+    zeros = np.zeros(cells.size, np.int32)
+    L.save_library({"FSP": zeros, "FPP": cells.astype(np.int32), "DTF": zeros.astype(np.float32), "segment": zeros,
+                    "fill": fill}, tmp_path / "column.parquet")
+    column = M._column_values(pq.read_table(tmp_path / "column.parquet").column("fill").combine_chunks())
+    kept, hundredths = LW.library_fill(path)
+    assert kept.dtype == np.int64 and hundredths.dtype == np.int32
+    assert np.array_equal(kept, cells[column != 0]) and np.array_equal(hundredths, column[column != 0])
+    assert json.loads(pl.read_parquet_metadata(path)["curve2flood:fldpln_fill"])["cells"] == kept.size
+    assert pl.scan_parquet(path).select(pl.len()).collect().item() == rows["FPP"].size
+    assert LW.library_fill(tmp_path / "column.parquet") is None and LW.library_fill(tmp_path / "rows.csv") is None
+
+    def never():
+        raise AssertionError("a CSV library has no footer")
+
+    with LW.LibraryWriter(tmp_path / "rows.csv", footer=never) as writer:
+        writer.write(rows)
+
+    with LW.LibraryWriter(tmp_path / "empty.parquet", footer=lambda: LW.fill_footer(cells, np.zeros(cells.size))) as writer:
+        writer.write(rows)
+    assert [a.size for a in LW.library_fill(tmp_path / "empty.parquet")] == [0, 0]
+    with pytest.raises(ValueError, match="ascending, each once"):
+        LW.fill_footer(np.array([3, 3]), np.array([1.0, 2.0]))
+    with pytest.raises(ValueError, match="doesn't fit"):
+        LW.fill_footer(np.array([3]), np.array([1e6]))
+
+
 def test_a_background_writer_writes_what_a_plain_one_does(tmp_path, monkeypatch):
     monkeypatch.setattr(LW, "_LIBRARY_SLICE_ROWS", 4)
     monkeypatch.setattr(LW, "_WRITES_AHEAD", 2)
@@ -1086,6 +1140,21 @@ def test_library_rows_are_sorted_and_skip_cells_without_a_dem_value():
     assert rows["FSP"].tolist() == [3, 3, 7, 7] and rows["FPP"].tolist() == [2, 9, 1, 5]
     assert rows["DTF"].tolist() == [3, 1, 2, 0] and rows["fill"].tolist() == [0, 2.5, 0, 0]
     assert rows["segment"].tolist() == [11] * 4 and rows["segment"].dtype == np.int32
+
+
+def test_library_rows_mark_their_cells_for_the_footer_rather_than_give_their_fill():
+    """With ``in_library``, the rows have no fill: their cells are marked in it, and the footer gives the fill of
+    those cells; without, each row has its cell's fill.  A cell without a DEM value is left out either way."""
+    fill_depth = np.arange(10, dtype=np.float32) + 0.5
+    fill_depth[2] = np.nan
+    args = (np.array([3, 3, 7, 7, 7], np.int32), np.array([5, 9, 1, 5, 2], np.int32), np.zeros(5, np.float32))
+    in_library = np.zeros(10, bool)
+    rows = L._library_rows(0, *args, fill_depth, in_library)
+    assert list(rows) == ["FSP", "FPP", "DTF", "segment"] and rows["FPP"].tolist() == [5, 9, 1, 5]
+    assert np.flatnonzero(in_library).tolist() == [1, 5, 9]
+    assert L._fill_footer(fill_depth, in_library) == LW.fill_footer(np.array([1, 5, 9]), fill_depth[[1, 5, 9]])
+    rows = L._library_rows(0, *args, fill_depth)
+    assert rows["FPP"].tolist() == [5, 9, 1, 5] and rows["fill"].tolist() == [5.5, 9.5, 1.5, 5.5]
 
 
 def test_ordered_map_keeps_the_order_and_few_tasks_ahead():
