@@ -487,6 +487,21 @@ def test_a_workspace_started_again_on_new_arrays_solves_the_same(rasters, monkey
             assert np.array_equal(a, b)
 
 
+def test_a_workspace_lets_go_of_its_arrays_before_it_makes_new_ones(rasters, monkeypatch):
+    """Windows charges new arrays against memory as they are made: the old ones are let go first, not held beside
+    them."""
+    fil, fdr, info = rasters
+    monkeypatch.setattr(W, "_RENEW_EVERY", 1)
+    workspace = _workspace(fil, fdr)
+    held = []
+    make = W._iterative_arrays
+    monkeypatch.setattr(W, "_iterative_arrays", lambda n: held.append(workspace.arrays) or make(n))
+    for stream_id in SEGMENTS[:2]:
+        L._segment_rows(fil, fdr, int(stream_id), info.values, 0.5, 0.1, 1.0, False, 0.0, BG, 0.0,
+                        workspace=workspace)
+    assert held == [None]  # the second segment's new arrays, made once the first's were let go
+
+
 @pytest.mark.parametrize("n", [5, 600, 5000])
 def test_the_radix_order_is_the_two_merge_sorts(n):
     """Ascending depth, then descending elevation, then the keys' own order; -0.0 ties with 0.0."""
@@ -1105,6 +1120,17 @@ def test_a_failure_in_the_writer_thread_is_raised_and_leaves_no_library(tmp_path
             writer.write_later(lambda: _toy_library())
             writer.write_later(fail)
     assert not (tmp_path / "library.parquet").exists() and not (tmp_path / "library.parquet.partial").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="only Windows keeps an open file from being replaced")
+def test_a_library_another_program_has_open_says_so_and_keeps_the_new_one(tmp_path):
+    with LW.LibraryWriter(tmp_path / "library.parquet") as writer:
+        writer.write(_toy_library())
+    with open(tmp_path / "library.parquet", "rb"):  # as a reader elsewhere holds it
+        with pytest.raises(PermissionError, match="another program may have it open"):
+            with LW.LibraryWriter(tmp_path / "library.parquet") as writer:
+                writer.write(_toy_library())
+    assert pd.read_parquet(tmp_path / "library.parquet.partial").equals(pd.read_parquet(tmp_path / "library.parquet"))
 
 
 def test_library_writer_without_rows_still_writes_the_columns(tmp_path):

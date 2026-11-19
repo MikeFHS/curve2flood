@@ -127,7 +127,10 @@ def build_fldpln_library(
         Show a progress bar.
     processes: int | None
         Number of threads when ``parallel``; defaults to the CPU count, at
-        most 4. Tests indicate that more threads do not help and consume more memory.
+        most 4. Tests indicate that more threads do not help and consume more memory:
+        each thread solves on arrays of its own, about 100 bytes a cell of the raster
+        (1.9 GB on 4320 by 4320 cells), which Windows counts against RAM and the page
+        file as soon as they are made.
     spill_decay: float
         Head (m) water spilling over a divide loses per pixel down its path. 
         The path's ``j``-th pixel floods

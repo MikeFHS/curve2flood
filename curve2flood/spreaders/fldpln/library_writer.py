@@ -182,9 +182,21 @@ class LibraryWriter:
             if self._writer is not None:
                 self._writer.close()
             if finished:
-                os.replace(self._partial, self.path)
+                self._replace()
             else:
                 self._partial.unlink(missing_ok=True)
+
+    def _replace(self):
+        """The finished file takes the library's name.  On Windows a file another program has open (QGIS, GDAL, a
+        Python process reading it) can't be replaced, and Windows only says "Access is denied": the error says so, and
+        the new library is kept beside it, as ``.partial``, rather than built again."""
+        try:
+            os.replace(self._partial, self.path)
+        except PermissionError as error:
+            raise PermissionError(
+                f"The library was built, but couldn't replace {self.path}: another program may have it open (on "
+                f"Windows, a file open in QGIS, GDAL or another Python process can't be replaced). The new library is "
+                f"{self._partial}: close that program and rename it to {self.path.name}.") from error
 
     def write_later(self, make_rows, *args):
         """``write(make_rows(*args))``, in the writer's thread if it has one: the rows are made and compressed

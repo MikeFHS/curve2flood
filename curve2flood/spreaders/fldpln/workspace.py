@@ -44,7 +44,11 @@ class Workspace:
         if self.solved == _RENEW_EVERY or self.counters.max() > 2 ** 30:
             # Each solve leaves the arrays as it found them, but for the generation stamps, which are only ever
             # compared with the current one: new arrays, with the stamps started again from 0, solve the same, and
-            # the old ones' memory goes back to the operating system (an array of zeros takes none until written)
+            # the old ones' memory goes back to the operating system (an array of zeros takes none until written).
+            # The old ones go first: Windows charges an array's whole size against RAM and the page file as soon as
+            # it is made, written or not, and making the new ones first held two workspaces (4.1 GB rather than
+            # 2.3 GB on a 4320 by 4320 tile)
+            self.arrays = None
             self.arrays = _iterative_arrays(self.fil.size)
             self.counters[:] = 0
             self.solved = 0
