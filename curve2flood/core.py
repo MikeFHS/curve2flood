@@ -36,6 +36,7 @@ from curve2flood.outputs import (
 from curve2flood.rating_curves import (
     Calculate_Depth_TopWidth_TWMax_Velocity,
     calculate_interpolated_vdt,
+    read_vdt_database,
 )
 from curve2flood.spreaders.fldpln import (
     FloodDepths,
@@ -592,12 +593,24 @@ class _FldplnInputs:
 
 class _Shared:
     """What the FLDPLN flood maps of several runs share (see ``Curve2Flood_Batch``): ``_FldplnInputs``, read once for
-    every run with the same library, flow directions, stream table and grid."""
+    every run with the same library, flow directions, stream table and grid, and while their flow events are queued,
+    each VDT database, read once for every run that has it."""
 
     def __init__(self, configs: list[Config]):
         # Libraries whose fill_below_dem a run's OutWSE needs
         self._with_wse = {self._key(c, None) for c in configs if _batched(c) and c.outwse}
         self._inputs = {}
+        self._vdts = {}
+
+    def vdt(self, path: str) -> pl.DataFrame:
+        """The VDT database at ``path`` (``read_vdt_database``), read once."""
+        if str(path) not in self._vdts:
+            self._vdts[str(path)] = read_vdt_database(path)
+        return self._vdts[str(path)]
+
+    def forget_vdts(self):
+        """Let go of the VDT databases, once every flow event is queued: the depths are mapped without them."""
+        self._vdts.clear()
 
     @staticmethod
     def _key(config: Config, shape) -> tuple:
@@ -617,12 +630,14 @@ def _batched(config: Config) -> bool:
     return config.mapper == FLDPLN and config.needs_flood_map
 
 
-def _queue_fldpln_event(config: Config, COMID_Unique_Flow, S_Rast, V_Rast, fldpln: _FldplnInputs) -> int:
-    """Queue one flow event on the FLDPLN library (``FloodDepths``): its segments' depths, from the VDT's WSE at
-    its flows (see ``make_fldpln_flood_map``).  When ``S_Rast`` is given, the stream cells' slopes are written into
-    it, and their valley slopes into ``V_Rast``.  Returns the event's number on ``fldpln.depths``."""
+def _queue_fldpln_event(config: Config, vdt: pl.DataFrame, COMID_Unique_Flow, S_Rast, V_Rast,
+                        fldpln: _FldplnInputs) -> int:
+    """Queue one flow event on the FLDPLN library (``FloodDepths``): its segments' depths, from the WSE of ``vdt``,
+    the run's VDT database (``read_vdt_database``), at its flows (see ``make_fldpln_flood_map``).  When ``S_Rast`` is
+    given, the stream cells' slopes are written into it, and their valley slopes into ``V_Rast``.  Returns the
+    event's number on ``fldpln.depths``."""
     vdt_df = calculate_interpolated_vdt(
-        config.print_vdt_database,
+        vdt,
         COMID_Unique_Flow,
         config.tw_multfact
     )
@@ -751,10 +766,15 @@ def _spread_flood_steps(
     # many of them, of this run and of the others sharing it (see FloodDepths)
     events = []
     if fldpln is not None:
+        # The VDT database, read once for every event (and with ``shared``, for every run with it), not once for
+        # each: reading it took most of an event's time.  It goes before the events are mapped.
+        vdt = shared.vdt(config.print_vdt_database) if shared is not None else \
+            read_vdt_database(config.print_vdt_database)
         for flow_event_num in range(num_flows):
             if not set_depth:
                 COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(config.comid_flow_file, flow_event_num)
-            events.append(_queue_fldpln_event(config, COMID_Unique_Flow, S_Rast, V_Rast, fldpln))
+            events.append(_queue_fldpln_event(config, vdt, COMID_Unique_Flow, S_Rast, V_Rast, fldpln))
+        del vdt
     yield
 
     # How many events flooded each cell: uint16 holds MAX_FLOW_EVENTS
@@ -915,6 +935,7 @@ def Curve2Flood_Batch(input_files: list[str | os.PathLike | Config | dict],
         else:
             _finish(steps)
 
+    shared.forget_vdts()
     for steps in queued:
         _finish(steps)
 

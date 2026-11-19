@@ -181,21 +181,9 @@ def vdt_interpolate(flow: np.ndarray,
 
     return top_width, depth, wse, vel
 
-def calculate_interpolated_vdt(
-        VDTDatabaseFileName: str,
-        COMID_Unique_Flow: dict,
-        TW_MultFact: float,
-        ) -> pl.DataFrame:
-    """Interpolate the VDT database at each reach's flow.
-
-    Returns one row per stream cell with ``TopWidth``, ``Depth``, ``WSE`` and
-    ``Velocity`` (see ``vdt_interpolate``), measured from the VDT's ``Elev``,
-    the channel bed under the cell.  Within each reach, cells outside the
-    1st-99th percentile of top width or velocity are dropped.  WSE isn't
-    filtered: it falls along a reach, so its extremes are the reach's two
-    ends, and dropping them left gaps at every junction.
-    """
-    LOG.debug('\nOpening and Reading ' + VDTDatabaseFileName)
+def read_vdt_database(VDTDatabaseFileName: str) -> pl.DataFrame:
+    """A VDT database, Parquet or CSV, whole, as ``calculate_interpolated_vdt`` reads it."""
+    LOG.debug('\nOpening and Reading ' + str(VDTDatabaseFileName))
 
     if is_parquet(VDTDatabaseFileName):
         vdt_df = pl.read_parquet(VDTDatabaseFileName)
@@ -206,6 +194,28 @@ def calculate_interpolated_vdt(
         raise ValueError("The VDT Database file is empty or could not be read properly.")
     if 'Elev' not in vdt_df.columns:
         raise ValueError(f"The VDT database {VDTDatabaseFileName} has no Elev column.")
+
+    return vdt_df
+
+def calculate_interpolated_vdt(
+        VDTDatabaseFileName: str | pl.DataFrame,
+        COMID_Unique_Flow: dict,
+        TW_MultFact: float,
+        ) -> pl.DataFrame:
+    """Interpolate the VDT database (its file, or the table ``read_vdt_database`` read from it, for several flows
+    to share) at each reach's flow.
+
+    Returns one row per stream cell with ``TopWidth``, ``Depth``, ``WSE`` and
+    ``Velocity`` (see ``vdt_interpolate``), measured from the VDT's ``Elev``,
+    the channel bed under the cell.  Within each reach, cells outside the
+    1st-99th percentile of top width or velocity are dropped.  WSE isn't
+    filtered: it falls along a reach, so its extremes are the reach's two
+    ends, and dropping them left gaps at every junction.
+    """
+    if isinstance(VDTDatabaseFileName, pl.DataFrame):
+        vdt_df = VDTDatabaseFileName
+    else:
+        vdt_df = read_vdt_database(VDTDatabaseFileName)
 
     # Add COMID flow information
     comid_flow_df = pl.DataFrame(data=list(COMID_Unique_Flow.items()), schema=['COMID', 'Flow'], orient='row')

@@ -707,7 +707,8 @@ def test_each_cell_floods_in_the_percentage_of_the_events_that_flood_it(tmp_path
 def test_a_batch_maps_each_run_as_it_maps_alone_reading_the_library_once(tmp_path, monkeypatch):
     """Three runs of _fldpln_depth's inputs, a flow file of three events and two of one, mapped together: each run's
     flood, depth and WSE rasters are what it maps alone, but the library's stream pixels and fills are read once for
-    all of them, and its depths in two passes, of the three events that fit in one and of the other two."""
+    all of them, as is the VDT database they share, and its depths in two passes, of the three events that fit in one
+    and of the other two.  Alone, each run reads the VDT database once, however many events it has."""
     _fldpln_depth(tmp_path)
     flows = {"a": {"q_a": [15.0], "q_b": [1.5], "q_c": [1.5]}, "b": {"q": [1.5]}, "c": {"q": [15.0]}}
     for name, columns in flows.items():
@@ -720,8 +721,12 @@ def test_a_batch_maps_each_run_as_it_maps_alone_reading_the_library_once(tmp_pat
             outputs["OutWSE"] = folder / f"{name}_wse.tif"
         return _fldpln_args(tmp_path, COMID_Flow_File=tmp_path / f"flows_{name}.pq", **outputs)
 
+    vdt_reads, read_vdt_database = [], core.read_vdt_database
+    monkeypatch.setattr(core, "read_vdt_database", lambda path: (vdt_reads.append(1), read_vdt_database(path))[1])
     for name in flows:
         Curve2Flood_MainFunction(args=settings(name, tmp_path / "alone"), quiet=True)
+    assert len(vdt_reads) == 3
+    vdt_reads.clear()
 
     passes, reads = [], []
     flood_depths, library_sources = fldpln_mapping._flood_depths, core.library_sources
@@ -732,7 +737,7 @@ def test_a_batch_maps_each_run_as_it_maps_alone_reading_the_library_once(tmp_pat
     monkeypatch.setattr(fldpln_mapping, "_PASS_BYTES", 3 * 15 * 4)  # Three events of the 3x5 grid
     Curve2Flood_Batch([settings(name, tmp_path / "together") for name in flows], quiet=True)
 
-    assert passes == [3, 2] and reads == [1]
+    assert passes == [3, 2] and reads == [1] and vdt_reads == [1]
     names = sorted(path.name for path in (tmp_path / "alone").iterdir())
     assert len(names) == 7 and names == sorted(path.name for path in (tmp_path / "together").iterdir())
     for name in names:
