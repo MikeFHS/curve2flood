@@ -302,8 +302,8 @@ def filter_outliers(df: pd.DataFrame) -> pd.DataFrame:
     Velocity.
 
     The reaches are the ``COMID`` column's, or the whole table without one.
-    A reach with a single row has no spread and keeps it.  Rows whose value
-    is NaN are dropped.
+    A reach with no spread keeps its nonmissing values.  Comparisons allow
+    small floating-point errors in the mean.  Rows whose value is NaN are dropped.
     """
     for col in ('TopWidth', 'WSE', 'Velocity'):
         values = df[col]
@@ -313,7 +313,10 @@ def filter_outliers(df: pd.DataFrame) -> pd.DataFrame:
         else:
             mean, std = values.mean(), values.std()
             std = 0.0 if np.isnan(std) else std
-        df = df[(values >= mean - 2 * std) & (values <= mean + 2 * std)]
+        # A computed mean can differ slightly from even identical values (pandas 3.1's grouped mean does).
+        tolerance = 8 * np.finfo(np.float64).eps * np.maximum(1.0, np.abs(mean))
+        within_bounds = np.abs(values - mean) <= 2 * std + tolerance
+        df = df[values.notna() & ((std == 0) | within_bounds)]
 
     return df
 
