@@ -517,11 +517,16 @@ def _solve_iterative_reusing(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarra
     of the window comes out as ``(row - halo) * out_cols + col - halo``: its
     window-local id with ``halo`` 0 and ``out_cols`` ``ncols``, or with 1
     and the raster's width, its raster id when the window is the raster.
+
+    Each cell is reset as the scan takes it, and the ``wet`` bits of its
+    neighbours, the only cells ``_flood`` sets them at: in the order the
+    cells flooded, scattered over the raster, resetting them took longer
+    than the scan.
     """
     n_flooded = _iterate(fil, fdr, inflow, has_data, ncols, sources, excluded, dh, fldmn, fldmx, iterative_spill,
                          global_max_wse, bg, spill_decay, arrays, counters)
-    dtf, fsp, in_flood, on_boundary, flood_depths, flooded = (arrays[0], arrays[1], arrays[2], arrays[3], arrays[4],
-                                                              arrays[13])
+    dtf, fsp, in_flood, on_boundary, flood_depths, flooded, wet = (arrays[0], arrays[1], arrays[2], arrays[3],
+                                                                   arrays[4], arrays[13], arrays[26])
     cells = np.empty(n_flooded, dtype=np.int32)
     out_dtf = np.empty(n_flooded, dtype=np.float32)
     out_fsp = np.empty(n_flooded, dtype=np.int32)
@@ -543,15 +548,12 @@ def _solve_iterative_reusing(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarra
                 source_row = source // ncols
                 out_fsp[k] = (source_row - halo) * out_cols + source - source_row * ncols - halo
                 k += 1
-    wet = arrays[26]
-    for i in range(n_flooded):
-        pixel = flooded[i]
-        dtf[pixel] = 0.0
-        fsp[pixel] = 0
-        in_flood[pixel] = False
-        on_boundary[pixel] = False
-        flood_depths[pixel] = 0.0
-        for neighbor in (pixel - ncols - 1, pixel - ncols, pixel - ncols + 1, pixel - 1, pixel + 1,
-                         pixel + ncols - 1, pixel + ncols, pixel + ncols + 1):
-            wet[neighbor] = 0
+                dtf[pixel] = 0.0
+                fsp[pixel] = 0
+                in_flood[pixel] = False
+                on_boundary[pixel] = False
+                flood_depths[pixel] = 0.0
+                for neighbor in (pixel - ncols - 1, pixel - ncols, pixel - ncols + 1, pixel - 1, pixel + 1,
+                                 pixel + ncols - 1, pixel + ncols, pixel + ncols + 1):
+                    wet[neighbor] = 0
     return cells[:k], out_dtf[:k], out_fsp[:k]
