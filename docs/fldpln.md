@@ -16,8 +16,7 @@ saved in a **floodplain library**, built once for a DEM and stream network, with
 (the flood source pixel, `FSP`) and a cell it can flood (the floodplain pixel, `FPP`), its `DTF`, the `segment` of
 stream the source pixel belongs to, and the cell's `fill`: how far the filled DEM sits above the DEM there, as in a
 filled pit or a burned channel. A cell's fill is the same in every row of it, so a Parquet library keeps it once a
-cell, in its footer metadata, rather than as a column: a cell's rows are far apart in the library, and on a flat tile a
-`fill` column took a third of it (416 of 1268 MB), where the footer takes 5 MB. A CSV library has a `fill` column, and
+cell, in its footer metadata, rather than as a column. A CSV library has a `fill` column, and
 so does a library saved with `save_library`; the mapper reads either.
 
 The footer key is `curve2flood:fldpln_fill`, and its value JSON: `version` (1), `cells`, how many cells have a fill

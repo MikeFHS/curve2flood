@@ -4,10 +4,6 @@ from numba import njit
 from .solvers import _iterative_arrays, _solve_iterative_reusing
 
 # Segments a Workspace solves before it starts again on new arrays: the cells segments flood take memory until then.
-# Each new start costs the faults of the pages written again: on a hilly one-degree tile, renewing every 8 segments
-# built the library in four times the time of every 1024 (57.6 s against 15.6 s), for 0.94 GB rather than 1.66 GB
-# (1.75 GB never renewing), and every 64 already took 1.44 GB.  On a flat tile, whose segments flood most of the
-# raster, renewing every 8 saved 0.12 GB of 2 GB, and took 11% longer.
 _RENEW_EVERY = 1024
 
 class Workspace:
@@ -46,12 +42,12 @@ class Workspace:
             # compared with the current one: new arrays, with the stamps started again from 0, solve the same, and
             # the old ones' memory goes back to the operating system (an array of zeros takes none until written).
             # The old ones go first: Windows charges an array's whole size against RAM and the page file as soon as
-            # it is made, written or not, and making the new ones first held two workspaces (4.1 GB rather than
-            # 2.3 GB on a 4320 by 4320 tile)
+            # it is made, written or not, and making the new ones first held two workspaces
             self.arrays = None
             self.arrays = _iterative_arrays(self.fil.size)
             self.counters[:] = 0
             self.solved = 0
+            
         self.solved += 1
         _mark_downstream(self.excluded, downstream, *self.channel, ncols, True)
         try:
