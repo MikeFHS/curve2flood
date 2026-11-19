@@ -750,6 +750,17 @@ def test_step_lengths_follow_the_flow_direction():
     assert steps.tolist() == pytest.approx([30.0, 40.0, 50.0, 35.0])
 
 
+def test_a_diagonal_step_is_correctly_rounded_on_every_system():
+    """A FIM site's cell size, whose diagonal Windows' C library (np.hypot there) gave one last digit short."""
+    from decimal import Decimal, getcontext
+
+    getcontext().prec = 60
+    dx, dy = 24.102076, 30.84148
+    exact = float((Decimal(dx) ** 2 + Decimal(dy) ** 2).sqrt())
+    assert exact == 39.14213785807025
+    assert L._step_lengths(np.array([0]), np.array([4], dtype=np.uint8), dx, dy)[0] == exact
+
+
 def test_split_reach_cuts_equal_lengths_and_keeps_the_reach_end():
     pixels = np.arange(100, 110)
     pieces = L._split_reach(np.array([100, 999, 10, 7]), pixels, np.full(10, 100.0), 300.0)

@@ -5,6 +5,7 @@ three mappers, and writes the requested rasters: flood extent, depth, water
 surface elevation (WSE), velocity and an optional topobathymetric DEM.
 """
 # built-in imports
+import math
 import os
 from dataclasses import dataclass
 
@@ -52,6 +53,8 @@ gdal.UseExceptions()
 
 # The most flow events one run maps
 MAX_FLOW_EVENTS = 655
+# The decimals, of a metre, a geographic DEM's cell size is rounded to (see convert_cell_size)
+CELL_SIZE_DECIMALS = 6
 
 def convert_cell_size(
     d_dem_cell_size_x: float,
@@ -62,9 +65,11 @@ def convert_cell_size(
 ):
     """Return the DEM cell size in metres as ``(dx, dy)``.
 
-    Geographic rasters (degrees) are converted with geodesic distances at the
-    raster's middle latitude.  Projected rasters are already in metres and are
-    returned unchanged.
+    A geographic DEM's (degrees) cells are measured on its ellipsoid at its middle latitude, by
+    ``cell_size_on_ellipsoid``, and rounded to the micrometre (``CELL_SIZE_DECIMALS``), as ARC measures them: rounded,
+    the size is the same on every system. Unrounded, its last digits differed between Windows and Linux, and with
+    them where the FLDPLN library cuts reaches into segments. Projected rasters are already in metres and are returned
+    unchanged.
     """
     d_x_cell_size = np.fabs(d_dem_cell_size_x)
     d_y_cell_size = np.fabs(d_dem_cell_size_y)
@@ -76,21 +81,48 @@ def convert_cell_size(
 
     if o_crs.is_geographic:
         d_lat = (d_dem_lower_left + d_dem_upper_right) / 2.0
-        d_lon = 0.0  # Geodesic spacing does not depend on longitude
-
-        # Build a geodesic calculator from the DEM ellipsoid.
-        o_ellps = o_crs.ellipsoid
-        if o_ellps is not None and o_ellps.semi_major_metre and o_ellps.inverse_flattening:
-            o_geod = Geod(a=o_ellps.semi_major_metre, rf=o_ellps.inverse_flattening)
-        else:
-            o_geod = Geod(ellps="WGS84")
-
-        _, _, d_y_metres = o_geod.inv(d_lon, d_lat, d_lon, d_lat + d_y_cell_size)
-        _, _, d_x_metres = o_geod.inv(d_lon, d_lat, d_lon + d_x_cell_size, d_lat)
-        d_x_cell_size = np.fabs(d_x_metres)
-        d_y_cell_size = np.fabs(d_y_metres)
+        o_geod = _geod(o_crs)
+        d_x_metres, d_y_metres = cell_size_on_ellipsoid(o_geod.a, o_geod.es, float(d_lat), float(d_x_cell_size),
+                                                        float(d_y_cell_size))
+        d_x_cell_size = round(d_x_metres, CELL_SIZE_DECIMALS)
+        d_y_cell_size = round(d_y_metres, CELL_SIZE_DECIMALS)
 
     return d_x_cell_size, d_y_cell_size
+
+def _geod(crs: CRS) -> Geod:
+    """The geodesic on a coordinate system's ellipsoid, from its semi-major axis and inverse flattening, or else
+    WGS 84, as ARC's ``Raster._geod``."""
+    ellipsoid = crs.ellipsoid
+    if ellipsoid is not None and ellipsoid.semi_major_metre:
+        if ellipsoid.inverse_flattening:
+            return Geod(a=ellipsoid.semi_major_metre, rf=ellipsoid.inverse_flattening)
+        return Geod(a=ellipsoid.semi_major_metre, b=ellipsoid.semi_minor_metre)  # a sphere
+    return Geod(ellps="WGS84")
+
+def cell_size_on_ellipsoid(a: float, e2: float, latitude: float, size_x: float, size_y: float) -> tuple[float, float]:
+    """The width and height in metres of a cell ``size_x`` by ``size_y`` degrees from a latitude to
+    ``latitude + size_y``, on an ellipsoid of semi-major axis ``a`` (m) and squared eccentricity ``e2``. ARC's
+    ``arc.io.raster.cell_size_on_ellipsoid``, formula for formula, so that both models measure a DEM alike: keep them
+    so.
+
+    Its height is the meridian's arc across it, by Simpson's rule on the meridian's radius of curvature; its width the
+    geodesic across it along the latitude: the parallel's arc, less its curvature's share,
+    ``(size_x sin(latitude))^2 / 24``. For cells of up to 36 arcseconds, both are pyproj's geodesics (``Geod.inv``) to
+    within 2e-9 m, the geodesics' own error. A geodesic is worked out from two distances from the equator, so a
+    last-digit difference in sin or cos from one system's C math library to another's moved it by 6e-10 m between
+    Windows and Linux: enough to round differently where a size falls that near a micrometre's half. These move by
+    1e-14 m.
+    """
+    phi, d_phi, d_lambda = math.radians(latitude), math.radians(size_y), math.radians(size_x)
+
+    def meridian_radius(at: float) -> float:
+        return a * (1.0 - e2) / (1.0 - e2 * math.sin(at) ** 2) ** 1.5
+
+    height = d_phi / 6.0 * (meridian_radius(phi) + 4.0 * meridian_radius(phi + d_phi / 2.0)
+                            + meridian_radius(phi + d_phi))
+    prime_vertical_radius = a / math.sqrt(1.0 - e2 * math.sin(phi) ** 2)
+    width = prime_vertical_radius * math.cos(phi) * d_lambda * (1.0 - (d_lambda * math.sin(phi)) ** 2 / 24.0)
+    return abs(width), abs(height)
 
 def create_weightbox(tw: int, dx: float, dy: float) -> np.ndarray:
     """Inverse squared distance weights for a ``(2*tw + 1)`` square window, float32.
@@ -960,9 +992,10 @@ def _run_steps(config: Config, num_flows: int | None, quiet: bool, flood_vdt_cel
         E = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)
         read_into(open_raster(config.dem_file), E[1:-1, 1:-1])
 
-    # Cell size from the geotransform; the vector magnitudes also handle rotated grids
-    dem_cell_size_x = np.hypot(dem_geotransform[1], dem_geotransform[2])
-    dem_cell_size_y = np.hypot(dem_geotransform[4], dem_geotransform[5])
+    # Cell size from the geotransform; the vector magnitudes also handle rotated grids. Python's hypot is the same on
+    # every system; the C library's (np.hypot) isn't
+    dem_cell_size_x = math.hypot(dem_geotransform[1], dem_geotransform[2])
+    dem_cell_size_y = math.hypot(dem_geotransform[4], dem_geotransform[5])
     dx, dy = convert_cell_size(dem_cell_size_x, dem_cell_size_y, yll, yur, dem_projection)
     LOG.info('Cellsize X = ' + str(dx))
     LOG.info('Cellsize Y = ' + str(dy))

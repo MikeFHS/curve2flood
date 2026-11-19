@@ -4,8 +4,9 @@
 
 1. **Read the settings** and check that everything the run needs is there (see
    [What a run needs](input_file.md#what-a-run-needs)).
-2. **Read the DEM**, and work out its cell size in metres. A DEM in degrees is measured with geodesic distances at its
-   middle latitude.
+2. **Read the DEM**, and work out its cell size in metres. A DEM in degrees is measured along its ellipsoid at its
+   middle latitude, by ARC's formulas, to the micrometre: unrounded, its last digits differed from one system's C math
+   library to another's, and with them where the FLDPLN library cuts reaches into segments.
 3. **Find the stream cells**: the rows and columns of the VDT database or curve file. With `Set_Depth`, they are the
    cells of `Stream_File` above 0 instead.
 4. **Map each flow event** (each column of the flow file):

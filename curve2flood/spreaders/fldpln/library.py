@@ -516,7 +516,7 @@ def _cell_size_metres(raster: str) -> tuple[float, float]:
     projection = ds.GetProjection()
     yur = gt[3]
     yll = yur - ds.RasterYSize * abs(gt[5])
-    size_x, size_y = np.hypot(gt[1], gt[2]), np.hypot(gt[4], gt[5])
+    size_x, size_y = math.hypot(gt[1], gt[2]), math.hypot(gt[4], gt[5])  # the same on every system (_step_lengths)
     if not projection:
         # No coordinate system: take the geotransform's units as metres
         return float(size_x), float(size_y)
@@ -915,7 +915,9 @@ def _step_lengths(pixels: np.ndarray, flat_fdr: np.ndarray, dx: float, dy: float
     steps = np.full(len(pixels), (dx + dy) / 2)
     steps[np.isin(codes, (2, 32))] = dx                     # east, west
     steps[np.isin(codes, (8, 128))] = dy                    # south, north
-    steps[np.isin(codes, (1, 4, 16, 64))] = np.hypot(dx, dy)
+    # Python's own hypot, correctly rounded on every system: the C library's (np.hypot) differed in its last digit
+    # between Windows and Linux for about one cell size in six, and with it where reaches were cut
+    steps[np.isin(codes, (1, 4, 16, 64))] = math.hypot(dx, dy)
     return steps
 
 def _profile_cuts(distance: np.ndarray, elevation: np.ndarray, max_deviation: float) -> np.ndarray:

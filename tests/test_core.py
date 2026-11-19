@@ -226,6 +226,81 @@ def test_convert_cell_size():
     assert dy == pytest.approx(30.72, abs=0.01)
 
 
+ARCSECOND = 1.0 / 3600.0
+
+
+def _geodesic_size(geod, latitude: float, size_x: float, size_y: float) -> tuple[float, float]:
+    return (abs(geod.inv(0.0, latitude, size_x, latitude)[2]),
+            abs(geod.inv(0.0, latitude, 0.0, latitude + size_y)[2]))
+
+
+@pytest.mark.parametrize("epsg, ellipsoid", [(4326, "WGS84"), (4269, "GRS80")])
+def test_a_geographic_dem_s_cells_are_its_geodesics_at_its_middle_latitude_to_the_micrometre(epsg, ellipsoid):
+    from pyproj import Geod
+
+    crs = osr.SpatialReference()
+    crs.ImportFromEPSG(epsg)
+    geod = Geod(ellps=ellipsoid)
+    for size_x, size_y, south, north in ((ARCSECOND, ARCSECOND, 34.0, 35.2), (0.001, 0.0005, -45.6, -45.0),
+                                         (ARCSECOND / 3, ARCSECOND / 3, 60.0, 60.1)):
+        size = core.convert_cell_size(size_x, -size_y, south, north, crs.ExportToWkt())
+        assert size == pytest.approx(_geodesic_size(geod, (south + north) / 2, size_x, size_y), abs=5e-7)
+        assert all(round(s, core.CELL_SIZE_DECIMALS) == s for s in size)
+
+
+@pytest.mark.parametrize("arcseconds", [1.0 / 3.0, 1.0, 3.0, 30.0])
+def test_a_cell_s_size_on_its_ellipsoid_is_its_geodesics(arcseconds):
+    """Within 3e-9 m, about the geodesics' own error, from 80 S to 80 N."""
+    from pyproj import Geod
+
+    wgs84, size = Geod(ellps="WGS84"), arcseconds * ARCSECOND
+    for latitude in np.linspace(-80.0, 80.0, 161):
+        assert core.cell_size_on_ellipsoid(wgs84.a, wgs84.es, float(latitude), size, size) == pytest.approx(
+            _geodesic_size(wgs84, float(latitude), size, size), abs=3e-9)
+
+
+def test_a_cell_s_size_is_the_same_to_the_micrometre_whatever_the_last_digits_of_sin_and_cos(monkeypatch):
+    """Another system's C math library may give sin and cos a last digit off. At the 1-degree tile at 50 N (buffered
+    by 0.1 degrees, as nencarta buffers it), the geodesic's height of a cell is 4e-10 m from a micrometre's half,
+    nearer than the geodesic moved between Windows and Linux; the cell size doesn't move."""
+    import math
+
+    from pyproj import Geod
+
+    wgs84 = Geod(ellps="WGS84")
+    top = 50 + 1.1 + ARCSECOND / 2.0
+    latitude = (top + (top - 4320 * ARCSECOND)) / 2.0
+    height = _geodesic_size(wgs84, latitude, ARCSECOND, ARCSECOND)[1]
+    assert abs((height * 1e6) % 1.0 - 0.5) < 1e-3  # within a nanometre of rounding either way
+
+    class OffBy:
+        """math, with sin and cos `ulps` last digits off."""
+        def __init__(self, ulps: int):
+            self.ulps = ulps
+
+        def __getattr__(self, name):
+            return getattr(math, name)
+
+        def _off(self, value: float) -> float:
+            for _ in range(abs(self.ulps)):
+                value = float(np.nextafter(value, np.inf if self.ulps > 0 else -np.inf))
+            return value
+
+        def sin(self, x: float) -> float:
+            return self._off(math.sin(x))
+
+        def cos(self, x: float) -> float:
+            return self._off(math.cos(x))
+
+    wkt = osr.SpatialReference()
+    wkt.ImportFromEPSG(4326)
+    sizes = set()
+    for ulps in (-2, -1, 0, 1, 2):
+        monkeypatch.setattr(core, "math", OffBy(ulps))
+        sizes.add(core.convert_cell_size(ARCSECOND, -ARCSECOND, top - 4320 * ARCSECOND, top, wkt.ExportToWkt()))
+    assert len(sizes) == 1
+
+
 def test_create_weightbox_is_inverse_squared_distance():
     box = core.create_weightbox(2, 10.0, 20.0)
     assert box.shape == (5, 5) and box.dtype == np.float32
