@@ -5,7 +5,9 @@ three mappers, and writes the requested rasters: flood extent, depth, water
 surface elevation (WSE), velocity and an optional topobathymetric DEM.
 """
 # built-in imports
+import math
 import os
+from dataclasses import dataclass
 
 # third-party imports
 import numpy as np
@@ -35,11 +37,14 @@ from curve2flood.outputs import (
 from curve2flood.rating_curves import (
     Calculate_Depth_TopWidth_TWMax_Velocity,
     calculate_interpolated_vdt,
+    read_vdt_database,
 )
 from curve2flood.spreaders.fldpln import (
+    FloodDepths,
     library_metadata,
     library_sources,
     make_fldpln_flood_map,
+    segment_depths,
 )
 from curve2flood.spreaders.kernel_weighted import spread_stream_cells
 from curve2flood.streamcell_values import StreamCellValues
@@ -48,6 +53,8 @@ gdal.UseExceptions()
 
 # The most flow events one run maps
 MAX_FLOW_EVENTS = 655
+# The decimals, of a metre, a geographic DEM's cell size is rounded to (see convert_cell_size)
+CELL_SIZE_DECIMALS = 6
 
 def convert_cell_size(
     d_dem_cell_size_x: float,
@@ -58,9 +65,11 @@ def convert_cell_size(
 ):
     """Return the DEM cell size in metres as ``(dx, dy)``.
 
-    Geographic rasters (degrees) are converted with geodesic distances at the
-    raster's middle latitude.  Projected rasters are already in metres and are
-    returned unchanged.
+    A geographic DEM's (degrees) cells are measured on its ellipsoid at its middle latitude, by
+    ``cell_size_on_ellipsoid``, and rounded to the micrometre (``CELL_SIZE_DECIMALS``), as ARC measures them: rounded,
+    the size is the same on every system. Unrounded, its last digits differed between Windows and Linux, and with
+    them where the FLDPLN library cuts reaches into segments. Projected rasters are already in metres and are returned
+    unchanged.
     """
     d_x_cell_size = np.fabs(d_dem_cell_size_x)
     d_y_cell_size = np.fabs(d_dem_cell_size_y)
@@ -72,21 +81,48 @@ def convert_cell_size(
 
     if o_crs.is_geographic:
         d_lat = (d_dem_lower_left + d_dem_upper_right) / 2.0
-        d_lon = 0.0  # Geodesic spacing does not depend on longitude
-
-        # Build a geodesic calculator from the DEM ellipsoid.
-        o_ellps = o_crs.ellipsoid
-        if o_ellps is not None and o_ellps.semi_major_metre and o_ellps.inverse_flattening:
-            o_geod = Geod(a=o_ellps.semi_major_metre, rf=o_ellps.inverse_flattening)
-        else:
-            o_geod = Geod(ellps="WGS84")
-
-        _, _, d_y_metres = o_geod.inv(d_lon, d_lat, d_lon, d_lat + d_y_cell_size)
-        _, _, d_x_metres = o_geod.inv(d_lon, d_lat, d_lon + d_x_cell_size, d_lat)
-        d_x_cell_size = np.fabs(d_x_metres)
-        d_y_cell_size = np.fabs(d_y_metres)
+        o_geod = _geod(o_crs)
+        d_x_metres, d_y_metres = cell_size_on_ellipsoid(o_geod.a, o_geod.es, float(d_lat), float(d_x_cell_size),
+                                                        float(d_y_cell_size))
+        d_x_cell_size = round(d_x_metres, CELL_SIZE_DECIMALS)
+        d_y_cell_size = round(d_y_metres, CELL_SIZE_DECIMALS)
 
     return d_x_cell_size, d_y_cell_size
+
+def _geod(crs: CRS) -> Geod:
+    """The geodesic on a coordinate system's ellipsoid, from its semi-major axis and inverse flattening, or else
+    WGS 84, as ARC's ``Raster._geod``."""
+    ellipsoid = crs.ellipsoid
+    if ellipsoid is not None and ellipsoid.semi_major_metre:
+        if ellipsoid.inverse_flattening:
+            return Geod(a=ellipsoid.semi_major_metre, rf=ellipsoid.inverse_flattening)
+        return Geod(a=ellipsoid.semi_major_metre, b=ellipsoid.semi_minor_metre)  # a sphere
+    return Geod(ellps="WGS84")
+
+def cell_size_on_ellipsoid(a: float, e2: float, latitude: float, size_x: float, size_y: float) -> tuple[float, float]:
+    """The width and height in metres of a cell ``size_x`` by ``size_y`` degrees from a latitude to
+    ``latitude + size_y``, on an ellipsoid of semi-major axis ``a`` (m) and squared eccentricity ``e2``. ARC's
+    ``arc.io.raster.cell_size_on_ellipsoid``, formula for formula, so that both models measure a DEM alike: keep them
+    so.
+
+    Its height is the meridian's arc across it, by Simpson's rule on the meridian's radius of curvature; its width the
+    geodesic across it along the latitude: the parallel's arc, less its curvature's share,
+    ``(size_x sin(latitude))^2 / 24``. For cells of up to 36 arcseconds, both are pyproj's geodesics (``Geod.inv``) to
+    within 2e-9 m, the geodesics' own error. A geodesic is worked out from two distances from the equator, so a
+    last-digit difference in sin or cos from one system's C math library to another's moved it by 6e-10 m between
+    Windows and Linux: enough to round differently where a size falls that near a micrometre's half. These move by
+    1e-14 m.
+    """
+    phi, d_phi, d_lambda = math.radians(latitude), math.radians(size_y), math.radians(size_x)
+
+    def meridian_radius(at: float) -> float:
+        return a * (1.0 - e2) / (1.0 - e2 * math.sin(at) ** 2) ** 1.5
+
+    height = d_phi / 6.0 * (meridian_radius(phi) + 4.0 * meridian_radius(phi + d_phi / 2.0)
+                            + meridian_radius(phi + d_phi))
+    prime_vertical_radius = a / math.sqrt(1.0 - e2 * math.sin(phi) ** 2)
+    width = prime_vertical_radius * math.cos(phi) * d_lambda * (1.0 - (d_lambda * math.sin(phi)) ** 2 / 24.0)
+    return abs(width), abs(height)
 
 def create_weightbox(tw: int, dx: float, dy: float) -> np.ndarray:
     """Inverse squared distance weights for a ``(2*tw + 1)`` square window, float32.
@@ -540,30 +576,149 @@ def spread_flood(
     the DEM for ``OutWSE`` a strip at a time when it is None.  ``num_flows``
     is the flow file's number of events, counted when None.
     """
-    set_depth = config.uses_set_depth
-    _check_dem_units(dem_projection)
+    return _finish(_spread_flood_steps(config, E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy,
+                                       dem_projection, quiet, flood_vdt_cells, num_flows))
 
-    if config.mapper == FLDPLN:
-        FlowDir = read_array(config.flow_direction_file, np.uint8)
-        _check_shape(FlowDir, (nrows, ncols), "Flow direction raster")
+
+def _finish(steps):
+    """Run a generator of steps (``_spread_flood_steps``, ``_run_steps``) to its end, and return what it returns."""
+    try:
+        while True:
+            next(steps)
+    except StopIteration as stop:
+        return stop.value
+
+
+@dataclass
+class _FldplnInputs:
+    """What the FLDPLN mapper reads besides the VDT and the flows, the same for every flow event of every run that
+    shares them (see ``_Shared``): the flow directions, the stream table, the library (its path, or a LazyFrame of a
+    CSV library), its stream pixels and fills, ``fill_below_dem`` (see ``library_sources``) and the flood events
+    queued on it (``FloodDepths``)."""
+    flow_dir: np.ndarray
+    stream_info: pl.DataFrame
+    library: str | pl.LazyFrame
+    sources: object
+    fill_below_dem: np.ndarray | None
+    depths: FloodDepths
+
+    @classmethod
+    def read(cls, config: Config, nrows: int, ncols: int, with_wse: bool) -> "_FldplnInputs":
+        """Read them for ``config``, with ``fill_below_dem`` when ``with_wse``."""
+        flow_dir = read_array(config.flow_direction_file, np.uint8)
+        _check_shape(flow_dir, (nrows, ncols), "Flow direction raster")
 
         stream_info = _read_table(config.stream_info_file, ['stream_id', 'start_pixel', 'length'])
 
         # A Parquet library is read by its path, a part at a time (see make_fldpln_flood_map)
         if is_parquet(config.fldpln_library):
-            fldpln_library = config.fldpln_library
+            library = config.fldpln_library
         else:
-            fldpln_library = pl.scan_csv(config.fldpln_library)
+            library = pl.scan_csv(config.fldpln_library)
         # How far the filled DEM sits below the DEM, from the library, for the water surface (see water_surface)
-        fill_below_dem = np.full((nrows, ncols), np.nan, np.float32) if config.outwse else None
+        fill_below_dem = np.full((nrows, ncols), np.nan, np.float32) if with_wse else None
         # The library's stream pixels and fills are the same for every event: read once, writing fill_below_dem
-        sources = library_sources(fldpln_library, nrows * ncols, fill_below_dem)
-    else:
-        FlowDir = None
-        fill_below_dem = None
-        stream_info = None
-        fldpln_library = None
-        sources = None
+        sources = library_sources(library, nrows * ncols, fill_below_dem)
+        return cls(flow_dir, stream_info, library, sources, fill_below_dem, FloodDepths(library, sources,
+                                                                                         (nrows, ncols)))
+
+
+class _Shared:
+    """What the FLDPLN flood maps of several runs share (see ``Curve2Flood_Batch``): ``_FldplnInputs``, read once for
+    every run with the same library, flow directions, stream table and grid, and while their flow events are queued,
+    each VDT database, read once for every run that has it."""
+
+    def __init__(self, configs: list[Config]):
+        # Libraries whose fill_below_dem a run's OutWSE needs
+        self._with_wse = {self._key(c, None) for c in configs if _batched(c) and c.outwse}
+        self._inputs = {}
+        self._vdts = {}
+
+    def vdt(self, path: str) -> pl.DataFrame:
+        """The VDT database at ``path`` (``read_vdt_database``), read once."""
+        if str(path) not in self._vdts:
+            self._vdts[str(path)] = read_vdt_database(path)
+        return self._vdts[str(path)]
+
+    def forget_vdts(self):
+        """Let go of the VDT databases, once every flow event is queued: the depths are mapped without them."""
+        self._vdts.clear()
+
+    @staticmethod
+    def _key(config: Config, shape) -> tuple:
+        return (str(config.fldpln_library), str(config.flow_direction_file), str(config.stream_info_file), shape)
+
+    def fldpln(self, config: Config, nrows: int, ncols: int) -> _FldplnInputs:
+        key = self._key(config, (nrows, ncols))
+        if key not in self._inputs:
+            with_wse = config.outwse or self._key(config, None) in self._with_wse
+            self._inputs[key] = _FldplnInputs.read(config, nrows, ncols, with_wse)
+        return self._inputs[key]
+
+
+def _batched(config: Config) -> bool:
+    """Whether ``config``'s run maps its floods in two steps, its flow events' depths from passes of its FLDPLN
+    library shared with other runs (see ``Curve2Flood_Batch``): FLDPLN flood maps."""
+    return config.mapper == FLDPLN and config.needs_flood_map
+
+
+def _queue_fldpln_event(config: Config, vdt: pl.DataFrame, COMID_Unique_Flow, S_Rast, V_Rast,
+                        fldpln: _FldplnInputs) -> int:
+    """Queue one flow event on the FLDPLN library (``FloodDepths``): its segments' depths, from the WSE of ``vdt``,
+    the run's VDT database (``read_vdt_database``), at its flows (see ``make_fldpln_flood_map``).  When ``S_Rast`` is
+    given, the stream cells' slopes are written into it, and their valley slopes into ``V_Rast``.  Returns the
+    event's number on ``fldpln.depths``."""
+    vdt_df = calculate_interpolated_vdt(
+        vdt,
+        COMID_Unique_Flow,
+        config.tw_multfact
+    )
+    if S_Rast is not None:
+        S_Rast[vdt_df['Row'].to_numpy(), vdt_df['Col'].to_numpy()] = vdt_df['Slope'].to_numpy()
+    if V_Rast is not None:
+        V_Rast[vdt_df['Row'].to_numpy(), vdt_df['Col'].to_numpy()] = vdt_df['Valley_Slope'].to_numpy()
+
+    dof = segment_depths(vdt_df, fldpln.flow_dir, fldpln.stream_info, fldpln.sources)
+    return fldpln.depths.add(dof, config.fldpln_min_flood_depth)
+
+
+def _fldpln_event_maps(config: Config, fldpln: _FldplnInputs, event: int):
+    """``(flood, depth, None)`` of a queued flow event (``_queue_fldpln_event``), as ``_make_fldpln_flood_map``
+    gives them."""
+    depth = fldpln.depths.take(event)
+    # 1 where the depth is above 0, else 0: the comparison's bools are those bytes
+    Flood_array = np.greater(depth, 0).view(np.uint8)
+    # Depths are only used to write depth, WSE or velocity rasters
+    Depth_array = depth if config.outdep or config.outwse or config.outvel else None
+    return Flood_array, Depth_array, None  # Slopes are spread after all events are mapped
+
+
+def _spread_flood_steps(
+        config: Config,
+        E: np.ndarray | None,
+        nrows: int,
+        ncols: int,
+        WeightBox: np.ndarray,
+        TW_for_WeightBox_ElipseMask: int,
+        dx: float,
+        dy: float,
+        dem_projection: str,
+        quiet: bool = False,
+        flood_vdt_cells: bool = False,
+        num_flows: int | None = None,
+        shared: _Shared | None = None):
+    """``spread_flood``, as a generator: it stops once, with every flow event of an FLDPLN flood map queued on its
+    library (``_queue_fldpln_event``), and returns ``spread_flood``'s outputs.  The FLDPLN inputs are ``shared``'s,
+    when given (see ``Curve2Flood_Batch``)."""
+    set_depth = config.uses_set_depth
+    _check_dem_units(dem_projection)
+
+    fldpln = None
+    fill_below_dem = None
+    if config.mapper == FLDPLN:
+        fldpln = (shared.fldpln(config, nrows, ncols) if shared is not None else
+                  _FldplnInputs.read(config, nrows, ncols, bool(config.outwse)))
+        fill_below_dem = fldpln.fill_below_dem
 
     LOG.info("Executing flood mapping logic...")
 
@@ -639,6 +794,21 @@ def spread_flood(
             V_Rast = raster(np.nan)
             channel = channel_cells(config.print_vdt_database, nrows, ncols, dx, dy)
 
+    # An FLDPLN flood map queues every event's depths on its library first, so that one pass of the library maps
+    # many of them, of this run and of the others sharing it (see FloodDepths)
+    events = []
+    if fldpln is not None:
+        # The VDT database, read once for every event (and with ``shared``, for every run with it), not once for
+        # each: reading it took most of an event's time.  It goes before the events are mapped.
+        vdt = shared.vdt(config.print_vdt_database) if shared is not None else \
+            read_vdt_database(config.print_vdt_database)
+        for flow_event_num in range(num_flows):
+            if not set_depth:
+                COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(config.comid_flow_file, flow_event_num)
+            events.append(_queue_fldpln_event(config, vdt, COMID_Unique_Flow, S_Rast, V_Rast, fldpln))
+        del vdt
+    yield
+
     # How many events flooded each cell: uint16 holds MAX_FLOW_EVENTS
     Flood_Ensemble = np.zeros((nrows, ncols), dtype=np.uint16 if num_flows > 1 else np.uint8)
     # The largest depth and slope over the events so far (see accumulate_positive_max)
@@ -646,20 +816,24 @@ def spread_flood(
     Slope_Max = None
     for flow_event_num in range(num_flows):
         LOG.info('Working on Flow Event ' + str(flow_event_num))
-        # clear out last events values
-        if T_Rast is not None:
-            T_Rast[:] = -1.0
-        if W_Rast is not None:
-            W_Rast[:] = np.nan
+        if fldpln is not None:
+            Flood_array_this_flow, Depth_array, Slope_array = _fldpln_event_maps(config, fldpln,
+                                                                                 events[flow_event_num])
+        else:
+            # clear out last events values
+            if T_Rast is not None:
+                T_Rast[:] = -1.0
+            if W_Rast is not None:
+                W_Rast[:] = np.nan
 
-        if not set_depth:
-            COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(config.comid_flow_file, flow_event_num)
-        Flood_array_this_flow, Depth_array, Slope_array = Curve2Flood(
-            config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
-            COMID_Unique_Flow, WeightBox, TW_for_WeightBox_ElipseMask,
-            quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, FlowDir,
-            fill_below_dem, stream_info, fldpln_library, V_Rast, channel, sources
-            )
+            if not set_depth:
+                COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(config.comid_flow_file, flow_event_num)
+            Flood_array_this_flow, Depth_array, Slope_array = Curve2Flood(
+                config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
+                COMID_Unique_Flow, WeightBox, TW_for_WeightBox_ElipseMask,
+                quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, None,
+                None, None, None, V_Rast, channel, None
+                )
         Flood_array_this_flow = remove_cells_not_connected(Flood_array_this_flow, S)
         Flood_Ensemble += Flood_array_this_flow
         # Neither is read again
@@ -670,7 +844,7 @@ def spread_flood(
     # clear some memory by deleting large arrays that are no longer needed
     del T_Rast
     del W_Rast
-    del FlowDir
+    del fldpln
 
     return (_percent_of_events(Flood_Ensemble, num_flows), S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max,
             Slope_Max)
@@ -737,12 +911,71 @@ def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
     else:
         raise ValueError("Provide an input file, a dict of settings or a Config.")
 
-    # Everything the run reads and writes, before any of it
-    config.check_paths()
-    num_flows = None
-    if config.needs_flood_map and not config.uses_set_depth:
-        num_flows = check_flow_file(config.comid_flow_file)
+    Curve2Flood_Batch([config], quiet, flood_vdt_cells, bathymetry_creation_options)
 
+
+def Curve2Flood_Batch(input_files: list[str | os.PathLike | Config | dict],
+                      quiet: bool = False,
+                      flood_vdt_cells: bool = True,
+                      bathymetry_creation_options: list[str] | None = None):
+    """Run Curve2Flood on several inputs, as ``Curve2Flood_MainFunction`` runs each, but mapping the FLDPLN flood
+    maps of all of them that share a library together.
+
+    Reading the library takes most of an FLDPLN flood map's time, and is
+    the same for every flow event: so the library's stream pixels and fills
+    are read once for all of them, and its depths once for as many of their
+    events as ``_PASS_BYTES`` of rasters hold (see ``FloodDepths``), rather
+    than once for each run and each event.  The maps are the same as each
+    run's alone.  Every input is checked before any is run.
+
+    Parameters
+    ----------
+    input_files : list
+        Each run's settings: the path to an input file, a `Config`, or a dict
+        (see ``Curve2Flood_MainFunction``).
+    quiet, flood_vdt_cells, bathymetry_creation_options
+        As for ``Curve2Flood_MainFunction``, for every run.
+    """
+    configs = []
+    for input_file in input_files:
+        if isinstance(input_file, Config):
+            configs.append(input_file)
+        elif isinstance(input_file, dict):
+            configs.append(Config.from_mapping(input_file))
+        else:
+            configs.append(Config.from_file(input_file))
+
+    # Everything every run reads and writes, before any of it
+    flows = []
+    for config in configs:
+        config.check_paths()
+        num_flows = None
+        if config.needs_flood_map and not config.uses_set_depth:
+            num_flows = check_flow_file(config.comid_flow_file)
+        flows.append(num_flows)
+
+    # The FLDPLN flood maps first queue every flow event, and then all of them are mapped; the others run whole,
+    # each in turn, as they hold whole rasters
+    shared = _Shared(configs)
+    queued = []
+    for config, num_flows in zip(configs, flows):
+        steps = _run_steps(config, num_flows, quiet, flood_vdt_cells, bathymetry_creation_options,
+                           shared if _batched(config) else None)
+        if _batched(config):
+            next(steps)
+            queued.append(steps)
+        else:
+            _finish(steps)
+
+    shared.forget_vdts()
+    for steps in queued:
+        _finish(steps)
+
+
+def _run_steps(config: Config, num_flows: int | None, quiet: bool, flood_vdt_cells: bool,
+               bathymetry_creation_options: list[str] | None, shared: _Shared | None):
+    """A checked config's run (see ``Curve2Flood_MainFunction``), as a generator: it stops once, with every flow event
+    of an FLDPLN flood map queued on its library (see ``_spread_flood_steps``), and finishes the run when resumed."""
     grid = run_grid(config)
     dem_geotransform, dem_projection = grid.geotransform, grid.projection
     nrows, ncols = grid.nrows, grid.ncols
@@ -759,9 +992,10 @@ def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
         E = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)
         read_into(open_raster(config.dem_file), E[1:-1, 1:-1])
 
-    # Cell size from the geotransform; the vector magnitudes also handle rotated grids
-    dem_cell_size_x = np.hypot(dem_geotransform[1], dem_geotransform[2])
-    dem_cell_size_y = np.hypot(dem_geotransform[4], dem_geotransform[5])
+    # Cell size from the geotransform; the vector magnitudes also handle rotated grids. Python's hypot is the same on
+    # every system; the C library's (np.hypot) isn't
+    dem_cell_size_x = math.hypot(dem_geotransform[1], dem_geotransform[2])
+    dem_cell_size_y = math.hypot(dem_geotransform[4], dem_geotransform[5])
     dx, dy = convert_cell_size(dem_cell_size_x, dem_cell_size_y, yll, yur, dem_projection)
     LOG.info('Cellsize X = ' + str(dx))
     LOG.info('Cellsize Y = ' + str(dy))
@@ -774,10 +1008,12 @@ def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
         WeightBox = create_weightbox(TW_for_WeightBox_ElipseMask, dx, dy)
 
     if config.needs_flood_map:
-        flood_ensemble, S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max, Slope_Max = spread_flood(
+        flood_ensemble, S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max, Slope_Max = yield from _spread_flood_steps(
             config, E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy, dem_projection, quiet=quiet,
-            flood_vdt_cells=flood_vdt_cells, num_flows=num_flows)
+            flood_vdt_cells=flood_vdt_cells, num_flows=num_flows, shared=shared)
         main_flood_ouputs(flood_ensemble, fill_below_dem, S, S_Rast, V_Rast, Depth_Max, Slope_Max, channel, config, E, nrows, ncols, dem_projection, dem_geotransform)
+    else:
+        yield
 
     if bathymetry:
         create_bathymetry(config, E, nrows, ncols, dem_geotransform, dem_projection, bathymetry_creation_options)

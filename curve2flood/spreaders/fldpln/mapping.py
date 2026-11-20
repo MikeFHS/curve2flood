@@ -20,6 +20,11 @@ if TYPE_CHECKING:
 # in for the next. This saves memory, at no cost in time.
 _READ_ROWS = 1 << 18
 
+# The most bytes of heads one pass of a library maps (see FloodDepths): float32 rasters, one for each flood event of
+# the pass.  On a flat tile of 4320 by 4320 cells, a pass took 13 s, two thirds of a flood map's time, and 14 events
+# fit.
+_PASS_BYTES = 1 << 30
+
 @njit(cache=True, nogil=True)
 def _walk_reaches(starts: np.ndarray, lengths: np.ndarray, fdr: np.ndarray, nrows: int,
                   ncols: int) -> tuple[np.ndarray, np.ndarray]:
@@ -69,16 +74,21 @@ def library_sources(fldpln_library: pl.LazyFrame | str | os.PathLike, ncells: in
     """Read a library's stream pixels and fills, once whatever the flows (see ``make_fldpln_flood_map``).
 
     A cell's fill is the same in every row, so it is read here, a cell at a
-    time, and the depths need only ``(key, FPP, DTF)``.  ``fill_below_dem``,
-    a float32 raster of ``ncells`` cells, gets ``min(fill, 0)`` at every cell
-    of the library: how far the filled DEM sits below the DEM, for the water
-    surface.  ``scratch``, float32 of ``ncells`` cells, is worked in (made
-    when None) and left with every cell's fill, 0 off the library.
+    time, and the depths need only ``(key, FPP, DTF)``.  It is the
+    library's ``fill`` column, or without one, kept once a cell in its
+    Parquet footer (``library_fill``), as ``build_fldpln_library`` keeps
+    it.  ``fill_below_dem``, a float32 raster of ``ncells`` cells, NaN,
+    gets ``min(fill, 0)`` at every cell of the library: how far the filled
+    DEM sits below the DEM, for the water surface.  ``scratch``, float32 of
+    ``ncells`` cells, is worked in (made when None) and left with every
+    cell's fill, 0 off the library.
     """
     columns = _library_columns(fldpln_library)
-    if 'fill' not in columns:
-        raise ValueError("The FLDPLN library has no fill column. Rebuild it with build_fldpln_library, "
-                         "which now takes the DEM the floods are mapped on.")
+    footer = None if 'fill' in columns or isinstance(fldpln_library, pl.LazyFrame) else \
+        library_writer.library_fill(fldpln_library)
+    if 'fill' not in columns and footer is None:
+        raise ValueError("The FLDPLN library has no fill column, nor a fill in its footer. Rebuild it with "
+                         "build_fldpln_library, which now takes the DEM the floods are mapped on.")
 
     key = 'segment' if 'segment' in columns else 'FSP'
     group = ['segment', 'FSP'] if key == 'segment' else ['FSP']
@@ -90,8 +100,16 @@ def library_sources(fldpln_library: pl.LazyFrame | str | os.PathLike, ncells: in
     starts = own = np.empty(0, np.int32)
     pairs = {column: [] for column in group}
     own_fsp = []
-    for part in _library_parts(fldpln_library, group + ['FPP', 'fill']):
-        fsp, fill = part['FSP'], part['fill']
+    # With the fill in the footer, the rows are read with fills of 0, which only mark their cells in below
+    zeros = np.empty(0, np.int32)
+    for part in _library_parts(fldpln_library, group + ['FPP'] + (['fill'] if footer is None else [])):
+        fsp = part['FSP']
+        if footer is None:
+            fill = part['fill']
+        else:
+            if zeros.size < fsp.size:
+                zeros = np.zeros(fsp.size, np.int32)
+            fill = zeros[:fsp.size]
         if starts.size < fsp.size:
             starts, own = np.empty(fsp.size, np.int32), np.empty(fsp.size, np.int32)
         n_starts, n_own = _scan_sources(part[key], fsp, part['FPP'], fill, _scale(fill), last, starts, own, fill_of,
@@ -99,6 +117,12 @@ def library_sources(fldpln_library: pl.LazyFrame | str | os.PathLike, ncells: in
         for column in group:
             pairs[column].append(part[column][starts[:n_starts]])
         own_fsp.append(fsp[own[:n_own]])
+
+    if footer is not None:
+        cells, hundredths = footer
+        fill_of[cells] = _metres(hundredths)
+        if below.size > 0:
+            below[cells] = np.minimum(fill_of[cells], np.float32(0.0))
 
     pixels = pl.DataFrame({column: np.concatenate(pairs[column]) if pairs[column] else np.empty(0, np.int32)
                            for column in group}).unique()
@@ -121,7 +145,10 @@ def _scan_sources(segment, fsp, fpp, fill, scale, last, starts, own, fill_of, be
 
     Each row's fill, float32 ``fill / scale``, goes to its cell of
     ``fill_of`` unless 0 (``fill_of`` starts at 0), and of ``below``, unless
-    empty, as ``min(fill, 0)``.
+    empty, as ``min(fill, 0)``, where ``below`` is NaN (off the library) or
+    the fill isn't 0.  So with fills of 0, the rows only mark their cells
+    in ``below``, as ``library_sources`` reads a library whose fill is in
+    its footer.
     """
     zero = np.float32(0.0)
     n_starts = 0
@@ -144,8 +171,10 @@ def _scan_sources(segment, fsp, fpp, fill, scale, last, starts, own, fill_of, be
         raw = fill[i]
         if raw != 0:
             fill_of[cell] = np.float32(raw / scale)
-        if below.size > 0:
-            below[cell] = min(zero, np.float32(raw / scale))
+            if below.size > 0:
+                below[cell] = min(zero, np.float32(raw / scale))
+        elif below.size > 0 and np.isnan(below[cell]):
+            below[cell] = zero
 
     return n_starts, n_own
 
@@ -153,21 +182,26 @@ def _scan_sources(segment, fsp, fpp, fill, scale, last, starts, own, fill_of, be
 @njit(cache=True, nogil=True)
 def _deepest_heads(best: np.ndarray, key: np.ndarray, fpp: np.ndarray, dtf: np.ndarray, scale: float,
                    dof: np.ndarray):
-    """Raise ``best[p]`` to the head of each library row ``(key, p, DTF)`` above 0: ``dof[key] - DTF``, how deep the
-    water stands over ``p``'s filled surface, in float32 (``DTF`` is float32 ``dtf / scale``).
+    """Raise ``best[p, e]`` to the head of each library row ``(key, p, DTF)`` above 0 in each event ``e``:
+    ``dof[key, e] - DTF``, how deep the water stands over ``p``'s filled surface, in float32 (``DTF`` is float32
+    ``dtf / scale``).  ``best`` has a row for each cell and ``dof`` one for each key, and a column for each event.
 
     ``dof`` is NaN for a key without a depth, and a key outside it has none
     either.  The order of the rows doesn't matter.
     """
     zero = np.float32(0.0)
+    keys, events = dof.shape
     for i in range(key.size):
         k = key[i]
-        if k < 0 or k >= dof.size:
+        if k < 0 or k >= keys:
             continue
 
-        head = dof[k] - np.float32(dtf[i] / scale)
-        if head > zero and head > best[fpp[i]]:
-            best[fpp[i]] = head
+        drop = np.float32(dtf[i] / scale)
+        p = fpp[i]
+        for e in range(events):
+            head = dof[k, e] - drop
+            if head > zero and head > best[p, e]:
+                best[p, e] = head
 
 
 def _add_fill(best: np.ndarray, sources: LibrarySources):
@@ -177,6 +211,97 @@ def _add_fill(best: np.ndarray, sources: LibrarySources):
     heads = best[sources.fill_cells]
     reached = heads > -np.inf
     best[sources.fill_cells[reached]] = heads[reached] + sources.fill_values[reached]
+
+
+def _flood_depths(fldpln_library: pl.LazyFrame | str | os.PathLike, key: str, dof: np.ndarray, best: np.ndarray):
+    """Each cell's deepest head (``_deepest_heads``) in each event, into ``best`` (cells by events, -inf where none),
+    from one pass of the library: ``dof`` has a row for each key, a column for each event.
+
+    The library is read a part at a time and only each cell's deepest water
+    so far kept: joined whole, the library and its join were several times
+    the size of every raster in the run.
+    """
+    best.fill(-np.inf)
+    for part in _library_parts(fldpln_library, [key, 'FPP', 'DTF']):
+        dtf = part['DTF']
+        _deepest_heads(best, part[key], part['FPP'], dtf, _scale(dtf), dof)
+
+
+def _finish_depth(depth: np.ndarray, sources: LibrarySources, min_depth: float):
+    """One event's heads (a column of ``_flood_depths``, contiguous) made its depths, in place: the fill added
+    (``_add_fill``), and NaN where the depth isn't above 0 and at least ``min_depth`` (a NaN depth is NaN already)."""
+    _add_fill(depth, sources)
+    min_depth = np.float32(min_depth)
+    if min_depth > 0:
+        depth[depth < min_depth] = np.nan
+    elif min_depth <= 0:
+        depth[depth <= 0] = np.nan
+    else:
+        depth.fill(np.nan)
+
+
+class FloodDepths:
+    """The depth rasters of several flood events on one library, from as few passes of the library as
+    ``_PASS_BYTES`` of rasters allow (see ``make_fldpln_flood_map``).
+
+    ``add`` queues an event, its segments' depths (``segment_depths``), and
+    ``take`` gives its raster.  The first ``take`` of an event not mapped yet
+    maps it and the events queued after it, as many as fit, in one pass of
+    the library: reading the library takes most of a flood map's time, and
+    is the same whatever the event.  Each event's raster is taken once, best
+    in the order the events were queued.
+    """
+
+    def __init__(self, fldpln_library: pl.LazyFrame | str | os.PathLike, sources: LibrarySources,
+                 shape: tuple[int, int]):
+        self.library, self.sources, self.shape = fldpln_library, sources, shape
+        self._dofs: list[np.ndarray | None] = []  # None once taken
+        self._min_depths: list[float] = []
+        self._first = 0                             # The mapped block's first event
+        self._best = np.empty((0, 0), np.float32)   # Its heads, cells by events
+        self._left = 0                              # Its events not taken yet
+
+    def add(self, dof: np.ndarray | None, min_depth: float = 0.0) -> int:
+        """Queue an event: ``dof``, float32 by key, NaN for a key without a depth, or None when no segment has one
+        (``segment_depths``).  Returns its number, for ``take``."""
+        self._dofs.append(np.empty(0, np.float32) if dof is None else dof)
+        self._min_depths.append(min_depth)
+        return len(self._dofs) - 1
+
+    def take(self, event: int) -> np.ndarray:
+        """The event's depth raster (float32, NaN where it doesn't flood): mapped now, with the events queued after
+        it, unless it was with an earlier one."""
+        if self._dofs[event] is None:
+            raise ValueError(f"Flood event {event}'s depths were taken already.")
+        
+        if not self._first <= event < self._first + self._best.shape[1]:
+            if self._dofs[event].size == 0:  # Nothing floods: no pass needed
+                self._dofs[event] = None
+                return np.full(self.shape, np.nan, np.float32)
+            
+            self._map_from(event)
+        # One event's heads are the block itself; several are copied out of it
+        depth = self._best.reshape(-1) if self._best.shape[1] == 1 else self._best[:, event - self._first].copy()
+        self._dofs[event] = None
+        self._left -= 1
+        if self._left == 0:
+            self._best = np.empty((0, 0), np.float32)
+        _finish_depth(depth, self.sources, self._min_depths[event])
+        return depth.reshape(self.shape)
+
+    def _map_from(self, event: int):
+        """Map ``event`` and the events after it not taken yet, as many as ``_PASS_BYTES`` of heads hold, together."""
+        self._best = np.empty((0, 0), np.float32)  # Freed before the next block is made
+        cells = self.shape[0] * self.shape[1]
+        last = min(len(self._dofs), event + max(1, _PASS_BYTES // (4 * cells)))
+        dofs = self._dofs[event:last]
+        dof = np.full((max((d.size for d in dofs if d is not None), default=0), len(dofs)), np.nan, np.float32)
+        for e, d in enumerate(dofs):
+            if d is not None:
+                dof[:d.size, e] = d
+        best = np.empty((cells, len(dofs)), np.float32)
+        _flood_depths(self.library, self.sources.key, dof, best)
+        self._first, self._best, self._left = event, best, sum(d is not None for d in dofs)
 
 
 def make_fldpln_flood_map(
@@ -244,8 +369,24 @@ def make_fldpln_flood_map(
         sources = library_sources(fldpln_library, depth_array.size, fill_below_dem, scratch=depth_array.reshape(-1))
         depth_array.fill(np.nan)
 
-    if sources.pixels.is_empty():
+    dof = segment_depths(vdt_df, fdr, stream_info_df, sources)
+    if dof is None:
         return depth_array
+
+    # The heads, in depth_array itself
+    _flood_depths(fldpln_library, sources.key, dof.reshape(-1, 1), depth_array.reshape(-1, 1))
+    _finish_depth(depth_array.reshape(-1), sources, min_depth)
+    return depth_array
+
+
+def segment_depths(vdt_df: pl.DataFrame, fdr: np.ndarray, stream_info_df: pl.DataFrame | pd.DataFrame,
+                   sources: LibrarySources) -> np.ndarray | None:
+    """The depth ``DoF`` each key of the library (``sources.key``) floods at in one event, steps 1 and 2 of
+    ``make_fldpln_flood_map``: float32, indexed by the key itself, NaN for a key without one.  None when no key has
+    one, and nothing floods."""
+    nrows, ncols = fdr.shape
+    if sources.pixels.is_empty():
+        return None
 
     key, library_pixels, own_fsp, own_fill = sources.key, sources.pixels, sources.own_fsp, sources.own_fill
 
@@ -283,7 +424,7 @@ def make_fldpln_flood_map(
     pixel_stage = wse - (elevation + fill)
     measured = ~np.isnan(pixel_stage)
     if not measured.any():
-        return depth_array
+        return None
 
     # A pixel on two reaches keeps its deeper stage
     stage = (pl.DataFrame({'FSP': pixels, 'DoF': pl.Series(pixel_stage, dtype=pl.Float32, nan_to_null=True),
@@ -307,7 +448,7 @@ def make_fldpln_flood_map(
                       .join(place.select('FSP', 'position'), on='FSP', how='inner')
                       .sort(['segment', 'position']))
     if library_pixels.is_empty():
-        return depth_array
+        return None
     
     # A pixel without a VDT value takes its stage from its own segment's pixels with one; a segment without any has
     # none, and floods nothing
@@ -324,31 +465,12 @@ def make_fldpln_flood_map(
     # Each key's depth, looked up by the key itself
     valid = segments >= 0
     if not valid.any():
-        return depth_array
+        return None
     
     dof = np.full(int(segments[valid].max()) + 1, np.nan, dtype=np.float32)
     dof[segments[valid]] = depths[valid]
+    return dof
 
-    # Read the library a part at a time and keep only each pixel's deepest
-    # water so far, in ``depth_array`` itself: joined whole, the library and
-    # its join were several times the size of every raster in the run.
-    best = depth_array.reshape(-1)
-    best.fill(-np.inf)
-    for part in _library_parts(fldpln_library, [key, 'FPP', 'DTF']):
-        dtf = part['DTF']
-        _deepest_heads(best, part[key], part['FPP'], dtf, _scale(dtf), dof)
-
-    _add_fill(best, sources)
-    # NaN where the depth isn't above 0 and at least min_depth (a NaN depth is NaN already)
-    min_depth = np.float32(min_depth)
-    if min_depth > 0:
-        best[best < min_depth] = np.nan
-    elif min_depth <= 0:
-        best[best <= 0] = np.nan
-    else:
-        best.fill(np.nan)
-
-    return depth_array
 
 def _median_by_group(group: np.ndarray, value: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Each group's median: its middle value, or the lower of the two middle ones for an even count.

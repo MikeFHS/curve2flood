@@ -18,7 +18,7 @@ from curve2flood._log import LOG
 from curve2flood._raster import Grid, decoding_threads, open_raster, read_array
 from curve2flood.config import is_parquet
 
-from .library_writer import METADATA_VERSION, LibraryWriter
+from .library_writer import METADATA_VERSION, LibraryWriter, fill_footer
 from .solvers import (
     SOLVERS,
     _neighbour_bits_of_row,
@@ -127,7 +127,10 @@ def build_fldpln_library(
         Show a progress bar.
     processes: int | None
         Number of threads when ``parallel``; defaults to the CPU count, at
-        most 4. Tests indicate that more threads do not help and consume more memory.
+        most 4. Tests indicate that more threads do not help and consume more memory:
+        each thread solves on arrays of its own, about 100 bytes a cell of the raster
+        (1.9 GB on 4320 by 4320 cells), which Windows counts against RAM and the page
+        file as soon as they are made.
     spill_decay: float
         Head (m) water spilling over a divide loses per pixel down its path. 
         The path's ``j``-th pixel floods
@@ -347,7 +350,11 @@ def build_fldpln_library(
                   "with_bg_mask": bg_mask is not None, "with_water_mask": water_mask is not None},
     }
     limits = []
-    with LibraryWriter(library_file, background=True, metadata=metadata) as writer, \
+    # A Parquet library keeps each cell's fill once, in its footer (see fill_footer), rather than in every row of
+    # the cell: the cells with a row, marked as the rows are made, and their fills once they all are
+    in_library = np.zeros(grid.nrows * grid.ncols, dtype=np.bool_) if is_parquet(library_file) else None
+    footer = None if in_library is None else lambda: _fill_footer(fill_depth, in_library)
+    with LibraryWriter(library_file, background=True, metadata=metadata, footer=footer) as writer, \
             (ThreadPoolExecutor(processes) if parallel else contextlib.nullcontext()) as pool:
         if parallel:
             results = pbar(_ordered_map(pool, solve, args, 2 * processes), total=len(args),
@@ -357,7 +364,7 @@ def build_fldpln_library(
         for task, (fsp, fpp, dtf, limit) in zip(args, results):
             if limit is not None:
                 limits.append(limit)
-            writer.write_later(_library_rows, task[0], fsp, fpp, dtf, fill_depth)
+            writer.write_later(_library_rows, task[0], fsp, fpp, dtf, fill_depth, in_library)
 
     if limits:
         LOG.info(f"{len(limits)} of {len(args)} stream segments reached max_cells_per_segment={max_cells:,}; "
@@ -365,9 +372,11 @@ def build_fldpln_library(
                  f"(median {np.median(limits):.2f} m).")
         
 def _library_rows(segment: int, fsp: np.ndarray, fpp: np.ndarray, dtf: np.ndarray,
-                  fill_depth: "np.ndarray | SparseFill") -> dict[str, np.ndarray]:
+                  fill_depth: "np.ndarray | SparseFill", in_library: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """One segment's library rows, sorted by FSP and then FPP (which compresses well), with each cell's fill from
-    the flat ``fill_depth`` (or ``SparseFill``).  Cells without a DEM value (a NaN fill) never flood, and are left out."""
+    the flat ``fill_depth`` (or ``SparseFill``).  Cells without a DEM value (a NaN fill) never flood, and are left out.
+    With ``in_library`` (flat), the rows' cells are marked in it instead, and the rows have no fill: a Parquet library
+    keeps it in its footer (see ``_fill_footer``)."""
     order = np.lexsort((fpp, fsp))
     # Looked up in the cells' own order, ascending as the solvers give them, and then put in the rows'
     fill = fill_depth[fpp][order]
@@ -375,8 +384,20 @@ def _library_rows(segment: int, fsp: np.ndarray, fpp: np.ndarray, dtf: np.ndarra
     has_dem = np.isfinite(fill)
     if not has_dem.all():
         order, fpp, fill = order[has_dem], fpp[has_dem], fill[has_dem]
-    return {"FSP": fsp[order], "FPP": fpp, "DTF": dtf[order],
-            "segment": np.full(order.size, segment, dtype=np.int32), "fill": fill}
+    rows = {"FSP": fsp[order], "FPP": fpp, "DTF": dtf[order], "segment": np.full(order.size, segment, dtype=np.int32)}
+    if in_library is None:
+        rows["fill"] = fill
+    else:
+        in_library[fpp] = True
+    return rows
+
+
+def _fill_footer(fill_depth: "np.ndarray | SparseFill", in_library: np.ndarray) -> dict[bytes, bytes]:
+    """The footer metadata (``fill_footer``) of the fill of a library's cells, marked ``in_library``, from the flat
+    ``fill_depth`` (or ``SparseFill``)."""
+    cells = np.flatnonzero(in_library)
+    return fill_footer(cells, fill_depth[cells])
+
 
 def _version() -> str:
     """The installed curve2flood's version, or "unknown" when it runs from a copy that isn't installed."""
@@ -495,7 +516,7 @@ def _cell_size_metres(raster: str) -> tuple[float, float]:
     projection = ds.GetProjection()
     yur = gt[3]
     yll = yur - ds.RasterYSize * abs(gt[5])
-    size_x, size_y = np.hypot(gt[1], gt[2]), np.hypot(gt[4], gt[5])
+    size_x, size_y = math.hypot(gt[1], gt[2]), math.hypot(gt[4], gt[5])  # the same on every system (_step_lengths)
     if not projection:
         # No coordinate system: take the geotransform's units as metres
         return float(size_x), float(size_y)
@@ -894,7 +915,9 @@ def _step_lengths(pixels: np.ndarray, flat_fdr: np.ndarray, dx: float, dy: float
     steps = np.full(len(pixels), (dx + dy) / 2)
     steps[np.isin(codes, (2, 32))] = dx                     # east, west
     steps[np.isin(codes, (8, 128))] = dy                    # south, north
-    steps[np.isin(codes, (1, 4, 16, 64))] = np.hypot(dx, dy)
+    # Python's own hypot, correctly rounded on every system: the C library's (np.hypot) differed in its last digit
+    # between Windows and Linux for about one cell size in six, and with it where reaches were cut
+    steps[np.isin(codes, (1, 4, 16, 64))] = math.hypot(dx, dy)
     return steps
 
 def _profile_cuts(distance: np.ndarray, elevation: np.ndarray, max_deviation: float) -> np.ndarray:

@@ -13,6 +13,7 @@ from scipy.ndimage import generate_binary_structure, label, uniform_filter
 from curve2flood import (
     LOG,
     Config,
+    Curve2Flood_Batch,
     Curve2Flood_MainFunction,
     _ids,
     _raster,
@@ -24,6 +25,7 @@ from curve2flood import (
     remove_cells_not_connected,
 )
 from curve2flood.spreaders import fldpln, multi_point
+from curve2flood.spreaders.fldpln import mapping as fldpln_mapping
 
 gdal.UseExceptions()
 
@@ -224,6 +226,81 @@ def test_convert_cell_size():
     assert dy == pytest.approx(30.72, abs=0.01)
 
 
+ARCSECOND = 1.0 / 3600.0
+
+
+def _geodesic_size(geod, latitude: float, size_x: float, size_y: float) -> tuple[float, float]:
+    return (abs(geod.inv(0.0, latitude, size_x, latitude)[2]),
+            abs(geod.inv(0.0, latitude, 0.0, latitude + size_y)[2]))
+
+
+@pytest.mark.parametrize("epsg, ellipsoid", [(4326, "WGS84"), (4269, "GRS80")])
+def test_a_geographic_dem_s_cells_are_its_geodesics_at_its_middle_latitude_to_the_micrometre(epsg, ellipsoid):
+    from pyproj import Geod
+
+    crs = osr.SpatialReference()
+    crs.ImportFromEPSG(epsg)
+    geod = Geod(ellps=ellipsoid)
+    for size_x, size_y, south, north in ((ARCSECOND, ARCSECOND, 34.0, 35.2), (0.001, 0.0005, -45.6, -45.0),
+                                         (ARCSECOND / 3, ARCSECOND / 3, 60.0, 60.1)):
+        size = core.convert_cell_size(size_x, -size_y, south, north, crs.ExportToWkt())
+        assert size == pytest.approx(_geodesic_size(geod, (south + north) / 2, size_x, size_y), abs=5e-7)
+        assert all(round(s, core.CELL_SIZE_DECIMALS) == s for s in size)
+
+
+@pytest.mark.parametrize("arcseconds", [1.0 / 3.0, 1.0, 3.0, 30.0])
+def test_a_cell_s_size_on_its_ellipsoid_is_its_geodesics(arcseconds):
+    """Within 3e-9 m, about the geodesics' own error, from 80 S to 80 N."""
+    from pyproj import Geod
+
+    wgs84, size = Geod(ellps="WGS84"), arcseconds * ARCSECOND
+    for latitude in np.linspace(-80.0, 80.0, 161):
+        assert core.cell_size_on_ellipsoid(wgs84.a, wgs84.es, float(latitude), size, size) == pytest.approx(
+            _geodesic_size(wgs84, float(latitude), size, size), abs=3e-9)
+
+
+def test_a_cell_s_size_is_the_same_to_the_micrometre_whatever_the_last_digits_of_sin_and_cos(monkeypatch):
+    """Another system's C math library may give sin and cos a last digit off. At the 1-degree tile at 50 N (buffered
+    by 0.1 degrees, as nencarta buffers it), the geodesic's height of a cell is 4e-10 m from a micrometre's half,
+    nearer than the geodesic moved between Windows and Linux; the cell size doesn't move."""
+    import math
+
+    from pyproj import Geod
+
+    wgs84 = Geod(ellps="WGS84")
+    top = 50 + 1.1 + ARCSECOND / 2.0
+    latitude = (top + (top - 4320 * ARCSECOND)) / 2.0
+    height = _geodesic_size(wgs84, latitude, ARCSECOND, ARCSECOND)[1]
+    assert abs((height * 1e6) % 1.0 - 0.5) < 1e-3  # within a nanometre of rounding either way
+
+    class OffBy:
+        """math, with sin and cos `ulps` last digits off."""
+        def __init__(self, ulps: int):
+            self.ulps = ulps
+
+        def __getattr__(self, name):
+            return getattr(math, name)
+
+        def _off(self, value: float) -> float:
+            for _ in range(abs(self.ulps)):
+                value = float(np.nextafter(value, np.inf if self.ulps > 0 else -np.inf))
+            return value
+
+        def sin(self, x: float) -> float:
+            return self._off(math.sin(x))
+
+        def cos(self, x: float) -> float:
+            return self._off(math.cos(x))
+
+    wkt = osr.SpatialReference()
+    wkt.ImportFromEPSG(4326)
+    sizes = set()
+    for ulps in (-2, -1, 0, 1, 2):
+        monkeypatch.setattr(core, "math", OffBy(ulps))
+        sizes.add(core.convert_cell_size(ARCSECOND, -ARCSECOND, top - 4320 * ARCSECOND, top, wkt.ExportToWkt()))
+    assert len(sizes) == 1
+
+
 def test_create_weightbox_is_inverse_squared_distance():
     box = core.create_weightbox(2, 10.0, 20.0)
     assert box.shape == (5, 5) and box.dtype == np.float32
@@ -393,13 +470,18 @@ def _fldpln_depth(tmp_path, vdt_columns=None, library_metadata=None, with_dem=Tr
 
 def _rerun_fldpln(tmp_path, with_dem=True, **inputs):
     """Map ``_fldpln_depth``'s inputs, which it made, again, with these inputs."""
-    Curve2Flood_MainFunction(args={
+    Curve2Flood_MainFunction(args=_fldpln_args(tmp_path, with_dem, **inputs), quiet=True)
+
+
+def _fldpln_args(tmp_path, with_dem=True, **inputs):
+    """The settings ``_rerun_fldpln`` maps with."""
+    return {
         "Print_VDT_Database": tmp_path / "vdt.pq",
         "COMID_Flow_File": tmp_path / "flows.pq", "mapper": "Curve2Flood-FLDPLNpy",
         "Flow_Direction_File": tmp_path / "flowdir.tif", "Stream_Info_File": tmp_path / "stream_info.pq",
         "FLDPLN_Library": tmp_path / "library.pq", "Make_Output_GPKG": False,
         **({"DEM_File": tmp_path / "dem.tif"} if with_dem else {}), **inputs,
-    }, quiet=True)
+    }
 
 
 def test_the_fldpln_mapper_floods_only_from_its_minimum_depth(tmp_path):
@@ -695,6 +777,49 @@ def test_each_cell_floods_in_the_percentage_of_the_events_that_flood_it(tmp_path
     assert flood[1].tolist() == [100] * 5
     assert flood[0, 0] == 33 and flood.sum() == 5 * 100 + 33
     assert gdal.Open(str(tmp_path / "depth.tif")).ReadAsArray()[0, 0] == pytest.approx(1.3)
+
+
+def test_a_batch_maps_each_run_as_it_maps_alone_reading_the_library_once(tmp_path, monkeypatch):
+    """Three runs of _fldpln_depth's inputs, a flow file of three events and two of one, mapped together: each run's
+    flood, depth and WSE rasters are what it maps alone, but the library's stream pixels and fills are read once for
+    all of them, as is the VDT database they share, and its depths in two passes, of the three events that fit in one
+    and of the other two.  Alone, each run reads the VDT database once, however many events it has."""
+    _fldpln_depth(tmp_path)
+    flows = {"a": {"q_a": [15.0], "q_b": [1.5], "q_c": [1.5]}, "b": {"q": [1.5]}, "c": {"q": [15.0]}}
+    for name, columns in flows.items():
+        pd.DataFrame({"COMID": [1], **columns}).to_parquet(tmp_path / f"flows_{name}.pq")
+
+    def settings(name, folder):
+        folder.mkdir(exist_ok=True)
+        outputs = {"OutFLD": folder / f"{name}_flood.tif", "OutDEP": folder / f"{name}_depth.tif"}
+        if name == "b":
+            outputs["OutWSE"] = folder / f"{name}_wse.tif"
+        return _fldpln_args(tmp_path, COMID_Flow_File=tmp_path / f"flows_{name}.pq", **outputs)
+
+    vdt_reads, read_vdt_database = [], core.read_vdt_database
+    monkeypatch.setattr(core, "read_vdt_database", lambda path: (vdt_reads.append(1), read_vdt_database(path))[1])
+    for name in flows:
+        Curve2Flood_MainFunction(args=settings(name, tmp_path / "alone"), quiet=True)
+    assert len(vdt_reads) == 3
+    vdt_reads.clear()
+
+    passes, reads = [], []
+    flood_depths, library_sources = fldpln_mapping._flood_depths, core.library_sources
+    monkeypatch.setattr(fldpln_mapping, "_flood_depths", lambda library, key, dof, best: (
+        passes.append(dof.shape[1]), flood_depths(library, key, dof, best)))
+    monkeypatch.setattr(core, "library_sources", lambda *args, **kwargs: (
+        reads.append(1), library_sources(*args, **kwargs))[1])
+    monkeypatch.setattr(fldpln_mapping, "_PASS_BYTES", 3 * 15 * 4)  # Three events of the 3x5 grid
+    Curve2Flood_Batch([settings(name, tmp_path / "together") for name in flows], quiet=True)
+
+    assert passes == [3, 2] and reads == [1] and vdt_reads == [1]
+    names = sorted(path.name for path in (tmp_path / "alone").iterdir())
+    assert len(names) == 7 and names == sorted(path.name for path in (tmp_path / "together").iterdir())
+    for name in names:
+        alone = gdal.Open(str(tmp_path / "alone" / name)).ReadAsArray()
+        together = gdal.Open(str(tmp_path / "together" / name)).ReadAsArray()
+        assert np.array_equal(alone, together, equal_nan=True), name
+    assert gdal.Open(str(tmp_path / "together" / "a_flood.tif")).ReadAsArray()[0, 0] == 33
 
 
 def test_a_flow_file_has_at_most_655_events_and_no_negative_flow(tmp_path):

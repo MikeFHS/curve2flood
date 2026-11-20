@@ -413,10 +413,14 @@ def test_median_by_group():
     assert medians.tolist() == [2.0, 5.0]  # group 1: the middle of three; group 2: the lower middle of four
 
 
-def test_fldpln_needs_the_fill_column():
+def test_fldpln_needs_the_fill_column_or_a_fill_in_the_footer(tmp_path):
     library = pl.LazyFrame({"FSP": [5], "FPP": [0], "DTF": [0.1]})
-    with pytest.raises(ValueError, match="no fill column"):
+    with pytest.raises(ValueError, match="no fill column, nor a fill in its footer"):
         _fldpln_map(library)
+    path = tmp_path / "library.parquet"
+    library.collect().write_parquet(path)
+    with pytest.raises(ValueError, match="no fill column, nor a fill in its footer"):
+        fldpln_mapping.library_sources(str(path), 9)
 
 
 @pytest.mark.parametrize("segments", [True, False])
@@ -459,55 +463,113 @@ def _random_dof():
 
 
 def _libraries(tmp_path, columns):
-    """``columns`` as a LazyFrame of float32 metres, and saved as a Parquet library of decimals."""
+    """``columns`` as a LazyFrame of float32 metres, saved as a Parquet library of decimals with a fill column, and
+    as one that keeps each cell's fill once, in its footer, as build_fldpln_library does."""
     lazy = pl.LazyFrame({c: v.astype(np.float32) if c in ("DTF", "fill") else v for c, v in columns.items()})
     if np.isnan(columns["fill"]).any():
         return [lazy]
     path = tmp_path / "library.parquet"
     fldpln_library.save_library(pd.DataFrame(columns), path)
-    return [lazy, str(path)]
+    cells, first = np.unique(columns["FPP"], return_index=True)
+    footer = tmp_path / "footer.parquet"
+    with library_writer.LibraryWriter(footer, footer=lambda: library_writer.fill_footer(
+            cells, columns["fill"][first])) as writer:
+        writer.write({c: v for c, v in columns.items() if c != "fill"})
+    return [lazy, str(path), str(footer)]
 
 
 @pytest.mark.parametrize("nan_fill", [False, True])
 def test_deepest_heads_and_fill_are_numpy_s_maximum_at(tmp_path, monkeypatch, nan_fill):
     """Each cell's depth is the deepest of its rows' head plus its fill above 0, as every row's depth, the deepest
     kept by np.maximum.at, gives it: keys without a depth, or outside the lookup, are skipped, a NaN fill makes its
-    cell NaN, and a library of decimals read a part at a time gives what its float32 metres do."""
+    cell NaN, and a library of decimals read a part at a time gives what its float32 metres do.  Each event of a pass
+    gets what it gets alone."""
     monkeypatch.setattr(fldpln_mapping, "_READ_ROWS", 64)
     monkeypatch.setattr(library_writer, "_LIBRARY_SLICE_ROWS", 64)
     columns, cell_fill = _random_library(nan_fill=nan_fill)
-    dof = _random_dof()
+    dofs = [_random_dof(), np.array([0.5, 3.0, np.nan, 2.0], np.float32), np.empty(0, np.float32)]
     key, fpp = columns["segment"], columns["FPP"]
     dtf = columns["DTF"].astype(np.float32)
-    known = (key >= 0) & (key < dof.size)
-    head = np.where(known, dof[np.clip(key, 0, dof.size - 1)], np.float32(np.nan)) - dtf
-    reaches = known & (head > 0)
-    depth = head[reaches] + np.maximum(cell_fill[fpp[reaches]], np.float32(0.0))
-    expected = np.full(cell_fill.size, -np.inf, np.float32)
-    with np.errstate(invalid="ignore"):  # The NaN fill's depth
-        np.maximum.at(expected, fpp[reaches], depth)
-    assert np.isfinite(expected).sum() > 10 and np.isnan(expected).sum() == nan_fill
+    expected = []
+    for dof in dofs:
+        known = (key >= 0) & (key < dof.size)
+        head = np.where(known, dof[np.clip(key, 0, max(dof.size - 1, 0))] if dof.size else np.float32(np.nan),
+                        np.float32(np.nan)) - dtf
+        reaches = known & (head > 0)
+        depth = head[reaches] + np.maximum(cell_fill[fpp[reaches]], np.float32(0.0))
+        cells = np.full(cell_fill.size, -np.inf, np.float32)
+        with np.errstate(invalid="ignore"):  # The NaN fill's depth
+            np.maximum.at(cells, fpp[reaches], depth)
+        expected.append(cells)
+    assert np.isfinite(expected[0]).sum() > 10 and np.isnan(expected[0]).sum() == nan_fill
+    dof = np.full((5, len(dofs)), np.nan, np.float32)
+    for e, d in enumerate(dofs):
+        dof[:d.size, e] = d
     for library in _libraries(tmp_path, columns):
         sources = fldpln_mapping.library_sources(library, cell_fill.size)
-        best = np.full(cell_fill.size, -np.inf, np.float32)
-        for part in fldpln_mapping._library_parts(library, ["segment", "FPP", "DTF"]):
-            dtf_part = part["DTF"]
-            fldpln_mapping._deepest_heads(best, part["segment"], part["FPP"], dtf_part,
-                                          fldpln_mapping._scale(dtf_part), dof)
-        fldpln_mapping._add_fill(best, sources)
-        assert np.array_equal(best, expected, equal_nan=True)
+        best = np.empty((cell_fill.size, len(dofs)), np.float32)
+        fldpln_mapping._flood_depths(library, "segment", dof, best)
+        for e in range(len(dofs)):
+            column = best[:, e].copy()
+            fldpln_mapping._add_fill(column, sources)
+            assert np.array_equal(column, expected[e], equal_nan=True)
+
+
+def test_flood_depths_map_events_together_as_each_alone(tmp_path, monkeypatch):
+    """FloodDepths maps the events queued together, as many in a pass as _PASS_BYTES of heads hold, and each event's
+    raster is make_fldpln_flood_map's of it alone: in order or not, and an event where nothing floods without a
+    pass.  An event is taken once."""
+    columns, cell_fill = _random_library(n=200, cells=30)
+    library = _libraries(tmp_path, columns)[-1]
+    sources = fldpln_mapping.library_sources(library, cell_fill.size)
+    dofs = [_random_dof(), None, np.array([0.5, 3.0, np.nan, 2.0], np.float32), _random_dof() * 2,
+            np.array([4.0], np.float32)]
+    min_depths = [0.0, 0.0, 0.3, 0.0, 1.0]
+    alone = []
+    for dof, min_depth in zip(dofs, min_depths):
+        best = np.empty((cell_fill.size, 1), np.float32)
+        if dof is None:
+            alone.append(np.full((5, 6), np.nan, np.float32))
+            continue
+        fldpln_mapping._flood_depths(library, "segment", dof.reshape(-1, 1), best)
+        fldpln_mapping._finish_depth(best.reshape(-1), sources, min_depth)
+        alone.append(best.reshape(5, 6))
+    assert all(np.isfinite(depth).sum() > 3 for i, depth in enumerate(alone) if dofs[i] is not None)
+
+    passes = []
+    flood_depths = fldpln_mapping._flood_depths
+    monkeypatch.setattr(fldpln_mapping, "_flood_depths", lambda library, key, dof, best: (
+        passes.append(dof.shape[1]), flood_depths(library, key, dof, best)))
+    monkeypatch.setattr(fldpln_mapping, "_PASS_BYTES", 2 * 30 * 4)  # Two events
+    # In order: events 0 and 1 in a pass, 2 and 3 in the next, and 4 alone
+    for order, expected in (((0, 1, 2, 3, 4), [2, 2, 1]), ((4, 3, 1, 2, 0), None)):
+        passes.clear()
+        depths = fldpln_mapping.FloodDepths(library, sources, (5, 6))
+        assert [depths.add(dof, min_depth) for dof, min_depth in zip(dofs, min_depths)] == list(range(5))
+        for event in order:
+            assert np.array_equal(depths.take(event), alone[event], equal_nan=True)
+        assert expected is None or passes == expected
+    with pytest.raises(ValueError, match="taken already"):
+        depths.take(3)
 
 
 def test_library_sources_are_each_source_once_with_its_own_fill(tmp_path, monkeypatch):
     """Each (segment, FSP) once, however the parts split their rows; the sources with a row for their own cell, and
-    that cell's fill; the cells whose fill is above 0; and min(fill, 0) at every cell of the library, NaN off it."""
+    that cell's fill; the cells whose fill is above 0; and min(fill, 0) at every cell of the library, NaN off it:
+    from a fill column, or from the fill kept in the footer."""
     monkeypatch.setattr(fldpln_mapping, "_READ_ROWS", 5)
     monkeypatch.setattr(library_writer, "_LIBRARY_SLICE_ROWS", 5)
     columns, cell_fill = _random_library(n=120, cells=40)
+    zero = columns["FPP"][0]  # a cell of the library whose fill is 0, which the footer doesn't list
+    cell_fill[zero] = 0.0
+    columns["fill"] = np.where(columns["FPP"] == zero, 0.0, columns["fill"])
+    assert (cell_fill[columns["FPP"]] < 0).any()
     fsp, fpp, segment = columns["FSP"], columns["FPP"], columns["segment"]
     in_library = np.zeros(cell_fill.size, bool)
     in_library[fpp] = True
-    for library in _libraries(tmp_path, columns):
+    libraries = _libraries(tmp_path, columns)
+    assert len(libraries) == 3
+    for library in libraries:
         below = np.full(cell_fill.size, np.nan, np.float32)
         sources = fldpln_mapping.library_sources(library, cell_fill.size, fill_below_dem=below)
         assert sources.key == "segment"

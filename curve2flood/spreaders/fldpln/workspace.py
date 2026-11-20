@@ -3,8 +3,8 @@ from numba import njit
 
 from .solvers import _iterative_arrays, _solve_iterative_reusing
 
-# Segments a Workspace solves before it starts again on new arrays: the cells segments flood take memory until then
-_RENEW_EVERY = 8
+# Segments a Workspace solves before it starts again on new arrays: the cells segments flood take memory until then.
+_RENEW_EVERY = 1024
 
 class Workspace:
     """One thread's iterative solver, on the whole raster, kept from one segment to the next.
@@ -40,10 +40,14 @@ class Workspace:
         if self.solved == _RENEW_EVERY or self.counters.max() > 2 ** 30:
             # Each solve leaves the arrays as it found them, but for the generation stamps, which are only ever
             # compared with the current one: new arrays, with the stamps started again from 0, solve the same, and
-            # the old ones' memory goes back to the operating system (an array of zeros takes none until written)
+            # the old ones' memory goes back to the operating system (an array of zeros takes none until written).
+            # The old ones go first: Windows charges an array's whole size against RAM and the page file as soon as
+            # it is made, written or not, and making the new ones first held two workspaces
+            self.arrays = None
             self.arrays = _iterative_arrays(self.fil.size)
             self.counters[:] = 0
             self.solved = 0
+            
         self.solved += 1
         _mark_downstream(self.excluded, downstream, *self.channel, ncols, True)
         try:

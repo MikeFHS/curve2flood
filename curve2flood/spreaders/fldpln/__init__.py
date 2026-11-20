@@ -8,7 +8,10 @@ Water fills the filled DEM upstream (backfill) and spills over low divides
 into neighbouring valleys (spillover).  The library holds one row per
 (flood source pixel ``FSP``, floodplain pixel ``FPP``, ``DTF``, ``fill``),
 where ``fill`` is how far the filled DEM sits above the DEM at ``FPP``,
-and ``segment``, the stretch of stream the ``FSP`` belongs to.  Every pixel
+and ``segment``, the stretch of stream the ``FSP`` belongs to.  A cell's
+fill is the same in every row of it, so a Parquet library built by
+``build_fldpln_library`` keeps it once a cell, in its footer, rather than
+as a column (see ``library_writer.fill_footer``).  Every pixel
 of a segment starts at the same depth, so the library is exact for one water
 depth per segment, which is all mapping an event then needs.
 
@@ -40,9 +43,10 @@ indices, ``row * ncols + col``, of the grid a Parquet library records in its
 metadata (``library_metadata``), so a flood map needs no DEM to place them.
 """
 from .library_writer import library_metadata
-from .mapping import library_sources, make_fldpln_flood_map
+from .mapping import FloodDepths, library_sources, make_fldpln_flood_map, segment_depths
 
-__all__ = ["build_fldpln_library", "library_metadata", "library_sources", "make_fldpln_flood_map"]
+__all__ = ["FloodDepths", "build_fldpln_library", "library_metadata", "library_sources", "make_fldpln_flood_map",
+           "segment_depths"]
 
 
 def __getattr__(name):
